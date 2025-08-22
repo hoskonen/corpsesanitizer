@@ -1,0 +1,13 @@
+<kcd_mod>
+  <info>
+    <name>Corpse Sanitizer</name>
+    <modid>corpsesanitizer</modid>
+    <description>Sanitize loot when looting</description>
+    <author>hoskope</author>
+    <version>1.0</version>
+    <created_on>2025-08-20</created_on>
+  </info>
+  <supports>
+    <kcd_version>1.*</kcd_version>
+  </supports>
+</kcd_mod>
