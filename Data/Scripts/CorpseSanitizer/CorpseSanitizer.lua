@@ -1,17 +1,67 @@
--- CorpseSanitizer.lua (0.2.3) — WUID capture + corpse→stash resolution + read-only enumeration
+-- CorpseSanitizer.lua (0.2.4) — WUID capture + robust enumeration (read-only, cleaned)
+-- Defaults live here
 
-CorpseSanitizer = {
-    version = "0.2.3",
+CorpseSanitizer = CorpseSanitizer or {
+    version = "0.2.4",
     booted  = false,
-    config  = {
-        dryRun    = true,
-        minHealth = 0.50,
-        ui        = { movie = "ItemTransfer" },
-        proximity = { radius = 5.0, maxList = 24 },
-    },
     ui      = { active = false },
-    _loot   = { lastWUID = nil, lastOwnerId = nil },
+    _loot   = { lastWUID = nil },
 }
+
+local DEFAULT_CONFIG = {
+    dryRun       = false,
+    insanityMode = true,
+
+    ui           = { movie = "ItemTransfer" },
+    proximity    = { radius = 5.0, maxList = 24 },
+
+    nuker        = {
+        enabled      = false, -- set true to allow deletion
+        minHp        = 0.00,  -- delete items with hp >= this (0 deletes everything)
+        skipMoney    = true,  -- keep coins by default
+        onlyIfCorpse = true,  -- only run when a corpse context is detected
+    },
+
+    logging      = {
+        prettyOwner     = true, -- map WUIDs to "player/npc/<wuid>"
+        probeOnMiss     = true, -- probe neighbors when stash detection fails
+        showWouldDelete = true, -- in dryRun, log what would be deleted
+    },
+}
+
+-- Deep merge so overrides only replace provided keys
+local function deepMerge(dst, src)
+    if type(src) ~= "table" then return dst end
+    for k, v in pairs(src) do
+        if type(v) == "table" and type(dst[k]) == "table" then
+            deepMerge(dst[k], v)
+        else
+            dst[k] = v
+        end
+    end
+    return dst
+end
+
+-- Start with defaults
+CorpseSanitizer.config = deepMerge({}, DEFAULT_CONFIG)
+
+-- Load external overrides (should return a table!)
+local function loadExternalConfig()
+    local ok, overrides = pcall(dofile, "Scripts/CorpseSanitizer/CorpseSanitizerConfig.lua")
+    if ok and type(overrides) == "table" then
+        deepMerge(CorpseSanitizer.config, overrides)
+    end
+end
+
+-- Public helper so you can reload in-game if needed
+function CorpseSanitizer.ReloadConfig()
+    CorpseSanitizer.config = deepMerge({}, DEFAULT_CONFIG)
+    loadExternalConfig()
+end
+
+-- Load once at boot
+loadExternalConfig()
+
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Utilities
@@ -29,8 +79,7 @@ local function dist2(a, b)
 end
 
 local function scanNearbyOnce(radiusM, _maxList)
-    local player = getPlayer()
-    if not (player and player.GetWorldPos) then return {} end
+    local player = getPlayer(); if not (player and player.GetWorldPos) then return {} end
     local pos  = player:GetWorldPos()
     local iter = System.GetEntitiesInSphere and System.GetEntitiesInSphere(pos, radiusM or 5.0) or System.GetEntities()
     if not iter then return {} end
@@ -47,12 +96,31 @@ local function scanNearbyOnce(radiusM, _maxList)
     return list
 end
 
--- safe timer wrapper (keeps handler alive if something throws)
 local function later(ms, fn)
     Script.SetTimer(ms or 0, function()
         local ok, err = pcall(fn)
         if not ok then log("[timer] error: " .. tostring(err)) end
     end)
+end
+
+local function bool(x) return x and "true" or "false" end
+
+local function logEffectiveConfig()
+    local c    = CorpseSanitizer.config
+    local nuk  = c.nuker or {}
+    local lg   = c.logging or {}
+    local prox = c.proximity or {}
+    local ui   = c.ui or {}
+
+    log(string.format(
+        "cfg: dryRun=%s | insanityMode=%s | ui.movie=%s | radius=%.2f | nuker{enabled=%s,minHp=%.2f,skipMoney=%s,onlyIfCorpse=%s} | logging{prettyOwner=%s,probeOnMiss=%s,showWouldDelete=%s}",
+        bool(c.dryRun), bool(c.insanityMode),
+        tostring(ui.movie or "?"),
+        tonumber(prox.radius or 0) or 0,
+        bool(nuk.enabled), tonumber(nuk.minHp or 0) or 0,
+        bool(nuk.skipMoney), bool(nuk.onlyIfCorpse),
+        bool(lg.prettyOwner), bool(lg.probeOnMiss), bool(lg.showWouldDelete)
+    ))
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -74,44 +142,25 @@ local function getInventoryOwner(wuid)
     return nil
 end
 
-local function prettyOwner(wuid)
-    if not wuid or tostring(wuid) == "userdata: 0000000000000000" then return "none/unknown" end
-    -- try owner entity first (nicer label)
-    if XGenAIModule and type(XGenAIModule.GetOwnerEntity) == "function" then
-        local ok, ent = pcall(function() return XGenAIModule.GetOwnerEntity(wuid) end)
-        if ok and ent then
-            if ent.GetName then return tostring(wuid) .. " [" .. tostring(ent:GetName()) .. "]" end
-            if ent.class then return tostring(wuid) .. " [" .. tostring(ent.class) .. "]" end
-        end
+local _ownerPrettyCache = {}
+local function prettyOwner(ownerWuid, victim)
+    if not ownerWuid or tostring(ownerWuid) == "userdata: 0000000000000000" then
+        return "none/unknown"
     end
-    -- fallback: resolve entity by WUID if available
-    if XGenAIModule and type(XGenAIModule.GetEntityByWUID) == "function" then
-        local ok, ent = pcall(function() return XGenAIModule.GetEntityByWUID(wuid) end)
-        if ok and ent and ent.GetName then
-            return tostring(wuid) .. " [" .. tostring(ent:GetName()) .. "]"
-        end
-    end
-    return tostring(wuid)
+    -- victim?
+    local vw = victim and getEntityWuid and getEntityWuid(victim)
+    if vw and ownerWuid == vw then return "victim" end
+    -- player?
+    local p = System.GetEntityByName("player") or System.GetEntityByName("Henry") or System.GetEntityByName("dude")
+    local pw = p and getEntityWuid and getEntityWuid(p)
+    if pw and ownerWuid == pw then return "player" end
+    -- default short form
+    return tostring(ownerWuid)
 end
 
--- candidate inventory WUID for ownership checks on any entity
-local function getCandidateWuidForOwnership(e)
-    local w = getEntityWuid(e)
-    if w then return w, "entityWuid" end
-    if type(e.GetInventoryToOpen) == "function" then
-        local ok, w2 = pcall(function() return e:GetInventoryToOpen() end)
-        if ok and w2 then return w2, "GetInventoryToOpen()" end
-    end
-    if e.inventoryId and e.inventoryId ~= 0 then return e.inventoryId, "inventoryId" end
-    if e.stash and type(e.stash.GetMasterInventory) == "function" then
-        local ok, w3 = pcall(function() return e.stash:GetMasterInventory() end)
-        if ok and w3 then return w3, "stash:GetMasterInventory()" end
-    end
-    return nil, "noWuid"
-end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Corpse detection + stash resolution
+-- Corpse/NPC inspection + stash resolution
 -- ─────────────────────────────────────────────────────────────────────────────
 local function isCorpseEntity(e)
     if not e then return false end
@@ -123,29 +172,8 @@ local function isCorpseEntity(e)
     return cls:find("DeadBody", 1, true) ~= nil
 end
 
-local function isDeadEntity(e)
-    if not e then return false end
-    local s = e.soul or (e.GetSoul and e:GetSoul())
-    if s and type(s.IsDead) == "function" then
-        local ok, v = pcall(function() return s:IsDead() end); if ok and (v == true or v == 1) then return true end
-    end
-    if e.actor and type(e.actor.IsDead) == "function" then
-        local ok, v = pcall(function() return e.actor:IsDead() end); if ok and (v == true or v == 1) then return true end
-    end
-    if s and type(s.IsAlive) == "function" then
-        local ok, v = pcall(function() return s:IsAlive() end); if ok and v == false then return true end
-    end
-    if s and type(s.GetHealth) == "function" then
-        local ok, h = pcall(function() return s:GetHealth() end); if ok and tonumber(h) and h <= 0 then return true end
-    end
-    if s and type(s.GetHitPoints) == "function" then
-        local ok, h = pcall(function() return s:GetHitPoints() end); if ok and tonumber(h) and h <= 0 then return true end
-    end
-    return false
-end
-
 local function findNearestCorpse(radius)
-    local list   = scanNearbyOnce(radius or 5.0, 48)
+    local list = scanNearbyOnce(radius or 5.0, 48)
     local player = getPlayer()
     local best, bestD2
     for i = 1, #list do
@@ -155,6 +183,20 @@ local function findNearestCorpse(radius)
         end
     end
     return best, best and math.sqrt(bestD2 or 0) or nil
+end
+
+local function getCandidateWuidForOwnership(e)
+    local w = getEntityWuid(e); if w then return w, "entityWuid" end
+    if type(e.GetInventoryToOpen) == "function" then
+        local ok, w2 = pcall(function() return e:GetInventoryToOpen() end)
+        if ok and w2 then return w2, "GetInventoryToOpen()" end
+    end
+    if e.inventoryId and e.inventoryId ~= 0 then return e.inventoryId, "inventoryId" end
+    if e.stash and type(e.stash.GetMasterInventory) == "function" then
+        local ok, w3 = pcall(function() return e.stash:GetMasterInventory() end)
+        if ok and w3 then return w3, "stash:GetMasterInventory()" end
+    end
+    return nil, "noWuid"
 end
 
 local function resolveCorpseContainer(victim, searchRadius)
@@ -173,6 +215,7 @@ local function resolveCorpseContainer(victim, searchRadius)
         end
     end
     if best then return best, "StashCorpse" end
+
     if victim and vpos then
         local nearestStash, d2s
         for i = 1, #list do
@@ -182,7 +225,9 @@ local function resolveCorpseContainer(victim, searchRadius)
                 if not nearestStash or d2 < d2s then nearestStash, d2s = r.e, d2 end
             end
         end
-        if nearestStash and math.sqrt(d2s) <= 2.0 then return nearestStash, "Stash(victim-adjacent)" end
+        if nearestStash and math.sqrt(d2s) <= 2.0 then
+            return nearestStash, "Stash(victim-adjacent)"
+        end
     end
     return nil
 end
@@ -209,34 +254,78 @@ local function resolveCorpseContainerViaOwnership(victim, radius)
     return nil, "noOwnerMatch"
 end
 
--- ─────────────────────────────────────────────────────────────────────────────
--- Enumeration: read-only item listing
--- ─────────────────────────────────────────────────────────────────────────────
-local function resolveItemEntry(entry)
-    if ItemManager and ItemManager.GetItem and type(entry) == "userdata" then
-        local ok, it = pcall(ItemManager.GetItem, entry)
-        if ok and it then return it end
-    end
-    if type(entry) == "table" and (entry.class or entry.Class or entry.id or entry.Id) then
-        return entry
+-- Return true if 'entry' is a handle we can pass to Inventory.DeleteItem
+local function itemHandle(entry)
+    if type(entry) == "userdata" then return entry end
+    if type(entry) == "table" then
+        -- Some lists put the handle at .id / .Id
+        return entry.id or entry.Id or entry.handle or nil
     end
     return nil
 end
 
-local function getItemOwnerWuid(entry)
+-- Get the WUID that owns a *handle* (fast, no resolution to item table)
+local function ownerOfHandle(h)
+    if not (h and ItemManager and ItemManager.GetItemOwner) then return nil, "no-handle" end
+    local ok, w = pcall(ItemManager.GetItemOwner, h)
+    if ok and w then return w, "ItemManager.GetItemOwner(handle)" end
+    return nil, "no-owner"
+end
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Item enumeration (read-only) + pretty logging
+-- ─────────────────────────────────────────────────────────────────────────────
+local function resolveItemEntry(entry)
+    if ItemManager and ItemManager.GetItem and type(entry) == "userdata" then
+        local ok, it = pcall(ItemManager.GetItem, entry); if ok and it then return it end
+    end
+    if type(entry) == "table" and (entry.class or entry.Class or entry.id or entry.Id) then return entry end
+    return nil
+end
+
+-- Try to resolve item owner from an entry that might be a handle or table
+local function resolveItemOwner(entry)
+    -- If entry is an item handle (userdata), prefer ItemManager.GetItemOwner(handle)
     if type(entry) == "userdata" and ItemManager and ItemManager.GetItemOwner then
         local ok, w = pcall(ItemManager.GetItemOwner, entry)
         if ok and w then return w, "ItemManager.GetItemOwner(handle)" end
     end
+    -- If entry is a table already, see if it carries an owner field (rare)
+    if type(entry) == "table" then
+        if entry.owner or entry.Owner then
+            return entry.owner or entry.Owner, "entry.owner"
+        end
+        -- Some frameworks keep a backref from item to inventory/container
+        if entry.GetLinkedOwner and type(entry.GetLinkedOwner) == "function" then
+            local ok2, w2 = pcall(entry.GetLinkedOwner, entry)
+            if ok2 and w2 then return w2, "item:GetLinkedOwner()" end
+        end
+    end
+    return nil, "none"
+end
+
+
+local function getItemOwnerWuid(entry)
+    if type(entry) == "userdata" and ItemManager and ItemManager.GetItemOwner then
+        local ok, w = pcall(ItemManager.GetItemOwner, entry); if ok and w then
+            return w,
+                "ItemManager.GetItemOwner(handle)"
+        end
+    end
     if type(entry) == "table" and ItemManager and ItemManager.GetItemOwner then
         local id = entry.id or entry.Id
         if id then
-            local ok, w = pcall(ItemManager.GetItemOwner, id)
-            if ok and w then return w, "ItemManager.GetItemOwner(row.id)" end
+            local ok, w = pcall(ItemManager.GetItemOwner, id); if ok and w then
+                return w,
+                    "ItemManager.GetItemOwner(row.id)"
+            end
         end
         if type(entry.GetLinkedOwner) == "function" then
-            local ok, w = pcall(function() return entry:GetLinkedOwner() end)
-            if ok and w then return w, "item:GetLinkedOwner()" end
+            local ok, w = pcall(function() return entry:GetLinkedOwner() end); if ok and w then
+                return w,
+                    "item:GetLinkedOwner()"
+            end
         end
     end
     return nil, nil
@@ -254,10 +343,9 @@ local function getItemSummary(it)
     return class, hp, tostring(amt)
 end
 
-local function logItemsTable(items, how, cap)
+local function logItemsTable(items, how, cap, prettyNpc)
     cap = cap or 20
-    local keys = {}
-    for k in pairs(items) do keys[#keys + 1] = k end
+    local keys = {}; for k in pairs(items) do keys[#keys + 1] = k end
     table.sort(keys, function(a, b)
         local ta, tb = type(a), type(b)
         if ta == "number" and tb == "number" then return a < b end
@@ -267,19 +355,179 @@ local function logItemsTable(items, how, cap)
     end)
     local shown = 0
     for _, k in ipairs(keys) do
-        local row             = items[k]
-        local it              = resolveItemEntry(row)
-        local class, hp, amt  = getItemSummary(it)
-        local ownerWuid, lane = getItemOwnerWuid(row); if not ownerWuid then ownerWuid, lane = getItemOwnerWuid(it) end
-        local ownerStr = ownerWuid and prettyOwner(ownerWuid) or "?"
-        log(string.format("  [%s] class=%s hp=%s amt=%s owner=%s%s",
-            tostring(k), class, hp, amt, ownerStr, lane and (" [" .. lane .. "]") or ""))
+        local row                 = items[k]
+        local it                  = resolveItemEntry(row)
+        local class, hp, amt      = getItemSummary(it)
+
+        local ownerWuid, ownerVia = resolveItemOwner(row)
+        local ownerText           = ownerWuid and prettyOwner(ownerWuid, prettyNpc) or "none/unknown"
+        log(string.format("  [%s] class=%s hp=%s amt=%s owner=%s %s",
+            tostring(k), class, hp, tostring(amt), ownerText, ownerVia or ""))
+
         shown = shown + 1
         if shown >= cap then break end
     end
-    log("Enumerator used: " .. how .. string.format(" (raw keys walked, %d entries shown)", shown))
+    log("Enumerator used: " .. tostring(how) .. string.format(" (raw keys walked, %d entries shown)", shown))
 end
 
+-- Minimal neighborhood probe (used when stash wasn’t found)
+local function probeNearVictim(victim, radius)
+    local vpos = victim and victim.GetWorldPos and victim:GetWorldPos()
+    local list = scanNearbyOnce(radius or 12.0, 80)
+    local shown = 0
+    for i = 1, #list do
+        local e = list[i].e
+        if e and (e.class == "StashCorpse" or e.class == "Stash" or e.GetInventoryToOpen or e.inventoryId or e.stash or e.container or e.inventory) then
+            local via = {}
+            if type(e.GetInventoryToOpen) == "function" then via[#via + 1] = "GetInventoryToOpen" end
+            if e.inventoryId and e.inventoryId ~= 0 then via[#via + 1] = "invId" end
+            if e.stash then via[#via + 1] = "stash" end
+            if e.container then via[#via + 1] = "container" end
+            if e.inventory then via[#via + 1] = "inventory" end
+            local wuid = getEntityWuid(e)
+            local owner = wuid and getInventoryOwner(wuid)
+            local d = vpos and e.GetWorldPos and math.sqrt(dist2(vpos, e:GetWorldPos())) or math.sqrt(list[i].d2)
+
+            log(("[PROBE] name=%s class=%s d=%.2fm via=%s wuid=%s owner=%s")
+                :format(tostring(e.GetName and e:GetName() or "<unnamed>"),
+                    tostring(e.class or "?"), d, table.concat(via, "+"),
+                    tostring(wuid), owner and prettyOwner(owner) or "none/unknown"))
+            shown = shown + 1
+            if shown >= 8 then break end
+        end
+    end
+    if shown == 0 then log("[PROBE] No inventory-capable neighbors") end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NPC inventory lanes (read-only) + destructive (nuke) with dry-run
+-- ─────────────────────────────────────────────────────────────────────────────
+local function enumNPCInventory(npc)
+    if not npc then return nil, "noNPC" end
+    local inv = npc.inventory or npc.container or npc.stash
+    if inv and type(inv.GetInventoryTable) == "function" then
+        local ok, t = pcall(function() return inv:GetInventoryTable(inv) end)
+        if ok and type(t) == "table" then return t, "inventory:GetInventoryTable" end
+    end
+    local w = getEntityWuid(npc)
+    if w then
+        local lanes = {
+            { mod = "Inventory",       fn = "GetInventoryTable" },
+            { mod = "Inventory",       fn = "GetItems" },
+            { mod = "InventoryModule", fn = "GetInventoryTable" },
+            { mod = "InventoryModule", fn = "GetInventoryItems" },
+            { mod = "EntityModule",    fn = "GetInventoryTable" },
+            { mod = "EntityModule",    fn = "GetInventoryItems" },
+            { mod = "XGenAIModule",    fn = "GetInventoryItems" },
+        }
+        for _, L in ipairs(lanes) do
+            local M = _G[L.mod]
+            if M and type(M[L.fn]) == "function" then
+                local ok, t = pcall(function() return M[L.fn](w) end)
+                if ok and type(t) == "table" then return t, L.mod .. "." .. L.fn .. "(npcWUID)" end
+            end
+        end
+    end
+    return nil, "noEnumLane"
+end
+
+local function getNpcInventoryTable(npc)
+    local inv = npc and (npc.inventory or npc.container or npc.stash)
+    if not inv or type(inv) ~= "table" then return nil, "noInventoryComponent" end
+    for _, m in ipairs({ "GetInventoryTable", "GetAllItems", "GetItems" }) do
+        if type(inv[m]) == "function" then
+            local ok, t = pcall(function() return inv[m](inv) end)
+            if ok and type(t) == "table" then return t, "npc." .. m end
+        end
+    end
+    return nil, "noEnumerator"
+end
+
+local function extractDeletionTarget(entry)
+    if type(entry) == "userdata" then return { handle = entry } end
+    if type(entry) == "table" then
+        local handle = entry.id or entry.Id or entry.handle or entry.Handle
+        if handle then return { handle = handle } end
+        local class = entry.class or entry.Class
+        if class then
+            local count = tonumber(entry.amount or entry.Amount or 1) or 1
+            return { class = tostring(class), count = count }
+        end
+    end
+    return nil
+end
+
+-- Remove every item in an NPC's own inventory (NOT the player, NOT allies)
+local function nukeNpcInventory(npc)
+    local tag = (Config and Config.dryRun) and "[nuke][dry]" or "[nuke]"
+    if not npc then
+        log(tag .. " abort (no npc)")
+        return
+    end
+
+    -- Resolve the NPC's own WUID so we don't accidentally delete someone else's items
+    local npcWuid = getEntityWuid and getEntityWuid(npc) or nil
+    if not npcWuid then
+        log(tag .. " abort (no npc WUID)")
+        return
+    end
+
+    -- Try the direct NPC inventory table
+    local inv = npc.inventory
+    if not (inv and type(inv.GetInventoryTable) == "function") then
+        log(tag .. " abort (npc has no enumerable inventory)")
+        return
+    end
+
+    local ok, items = pcall(function() return inv:GetInventoryTable() end)
+    if not (ok and type(items) == "table") then
+        log(tag .. " abort (failed to get inventory list)")
+        return
+    end
+
+    local deleted, kept = 0, 0
+    -- Deletion order: numeric keys in ascending order (stable)
+    local keys = {}
+    for k in pairs(items) do if type(k) == "number" then keys[#keys + 1] = k end end
+    table.sort(keys)
+
+    for _, k in ipairs(keys) do
+        local row = items[k]
+        local h   = itemHandle(row)
+        if not h then
+            kept = kept + 1
+        else
+            -- double check ownership so we only touch the NPC's own items
+            local ownerWuid = select(1, ownerOfHandle(h))
+            if ownerWuid and ownerWuid ~= npcWuid then
+                -- belongs to someone else → skip
+                kept = kept + 1
+            else
+                if Config and Config.dryRun then
+                    local classId = (type(row) == "table") and (row.class or row.Class or row.id or row.Id) or "?"
+                    log(string.format("%s Would delete %s (%s)", tag, tostring(classId), tostring(h)))
+                    deleted = deleted + 1
+                else
+                    -- real deletion
+                    local okDel, err = pcall(function() return Inventory.DeleteItem(h) end)
+                    if okDel then
+                        deleted = deleted + 1
+                    else
+                        kept = kept + 1
+                        log(string.format("%s delete failed %s (%s): %s", tag,
+                            tostring(row and (row.class or row.Class) or "?"), tostring(h), tostring(err)))
+                    end
+                end
+            end
+        end
+    end
+
+    log(string.format("%s summary: deleted=%d kept=%d dry=%s", tag, deleted, kept, tostring(Config and Config.dryRun)))
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Stash/NPC enumeration lanes
+-- ─────────────────────────────────────────────────────────────────────────────
 local function tryEnumerateDirectOnEntity(ent)
     if not ent then return false end
     for _, comp in ipairs({ "inventory", "container", "stash" }) do
@@ -290,7 +538,7 @@ local function tryEnumerateDirectOnEntity(ent)
                     local ok, items = pcall(function() return c[m](c) end)
                     if ok and type(items) == "table" then
                         log(string.format("Direct: %s:%s → table(#%d)", comp, m, #items))
-                        logItemsTable(items, comp .. ":" .. m, 20)
+                        logItemsTable(items, comp .. ":" .. m, 20, ent)
                         return true
                     end
                 end
@@ -300,7 +548,7 @@ local function tryEnumerateDirectOnEntity(ent)
     return false
 end
 
-local function tryEnumerateByWuid(stashEnt, wuid)
+local function tryEnumerateByWuid(stashEntOrNpc, wuid)
     if EntityModule and wuid then
         local ok1, owner = pcall(function() return EntityModule.GetInventoryOwner(wuid) end)
         if ok1 then log("WUID owner = " .. tostring(owner)) end
@@ -309,7 +557,7 @@ local function tryEnumerateByWuid(stashEnt, wuid)
     end
 
     local function tryStashField(field)
-        local obj = stashEnt and stashEnt[field]
+        local obj = stashEntOrNpc and stashEntOrNpc[field]
         if obj and type(obj) == "table" then
             for _, m in ipairs({ "GetInventoryTable", "GetAllItems", "GetItems" }) do
                 if type(obj[m]) == "function" then
@@ -323,8 +571,7 @@ local function tryEnumerateByWuid(stashEnt, wuid)
         end
     end
     for _, f in ipairs({ "inventory", "container", "stash" }) do
-        local t, how = tryStashField(f)
-        if t then return t, how end
+        local t, how = tryStashField(f); if t then return t, how end
     end
 
     local lanes = {
@@ -334,11 +581,11 @@ local function tryEnumerateByWuid(stashEnt, wuid)
         { mod = "EntityModule",    fns = { "GetInventoryItems", "GetInventoryTable" } },
     }
     for _, lane in ipairs(lanes) do
-        local mod = _G[lane.mod]
-        if mod and wuid then
+        local M = _G[lane.mod]
+        if M and wuid then
             for _, fn in ipairs(lane.fns) do
-                if type(mod[fn]) == "function" then
-                    local ok, res = pcall(function() return mod[fn](wuid) end)
+                if type(M[fn]) == "function" then
+                    local ok, res = pcall(function() return M[fn](wuid) end)
                     if ok and type(res) == "table" then
                         log(("[%s].%s(wuid) → table size=%s"):format(lane.mod, fn, tostring(#res)))
                         return res, lane.mod .. "." .. fn .. "(wuid)"
@@ -347,7 +594,6 @@ local function tryEnumerateByWuid(stashEnt, wuid)
             end
         end
     end
-
     log("No item enumeration method succeeded for this WUID (read-only).")
     return nil, "none"
 end
@@ -384,8 +630,7 @@ local function installLootBeginHook()
 end
 
 local function installActorOpenHook()
-    local p = getPlayer()
-    local act = p and p.actor
+    local p = getPlayer(); local act = p and p.actor
     if not (act and type(act.OpenItemTransferStore) == "function") then
         log("Actor hook: OpenItemTransferStore not available"); return
     end
@@ -408,23 +653,35 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
     log(("OnOpened → transfer UI visible (element=%s, instance=%s)"):format(tostring(elementName), tostring(instanceId)))
 
     later(150, function()
-        local victim, vdist = findNearestCorpse(8.0)
+        local corpse, vdist = findNearestCorpse(8.0)
 
-        if victim then
-            local vWuid = getEntityWuid(victim)
-            log(("Victim (corpse): %s d=%.2fm vWUID=%s"):format(tostring(victim:GetName() or "<corpse>"), vdist or -1,
+        if corpse then
+            local vWuid = getEntityWuid(corpse)
+            log(("Victim (corpse): %s d=%.2fm vWUID=%s"):format(tostring(corpse:GetName() or "<corpse>"), vdist or -1,
                 tostring(vWuid)))
 
             -- A) direct tables on corpse entity
-            if tryEnumerateDirectOnEntity(victim) then return end
+            if tryEnumerateDirectOnEntity(corpse) then
+                if CorpseSanitizer.config.insanityMode then
+                    nukeNpcInventory(corpse)
+                else
+                    log(
+                        "[NUKE] skipped (insanityMode=false)")
+                end
+                return
+            end
 
             -- B) if the corpse exposes a WUID, try it
-            local vwuid, via = getCandidateWuidForOwnership(victim)
+            local vwuid, via = getCandidateWuidForOwnership(corpse)
             if vwuid then
                 log(("Victim WUID lane: %s → %s"):format(tostring(vwuid), via))
-                local items, how = tryEnumerateByWuid(victim, vwuid)
+                local items, how = tryEnumerateByWuid(corpse, vwuid)
                 if items then
-                    logItemsTable(items, how, 20); return
+                    logItemsTable(items, how, 20, corpse)
+                    nukeNpcInventory(corpse, items)
+                    if CorpseSanitizer.config.nuke and CorpseSanitizer.config.nuke.enabled then
+                        nukeNpcInventory(npc, items)
+                    end
                 end
             end
         else
@@ -432,8 +689,8 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
         end
 
         -- C) ownership match near corpse
-        if victim then
-            local stash, why = resolveCorpseContainerViaOwnership(victim, 12.0)
+        if corpse then
+            local stash, why = resolveCorpseContainerViaOwnership(corpse, 12.0)
             if stash then
                 log(("Loot container: %s via %s"):format(tostring(stash:GetName() or "<stash>"), why))
                 local swuid, lane = getStashInventoryWuid(stash)
@@ -441,7 +698,7 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
                 if swuid then
                     local items, how = tryEnumerateByWuid(stash, swuid)
                     if items then
-                        logItemsTable(items, how, 20); return
+                        logItemsTable(items, how, 20, corpse); return
                     end
                 end
             else
@@ -462,32 +719,32 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
             log("OnOpened: no hooked WUID (hook may be missing in this build)")
         end
 
-        -- E) final fallback — nearest dead hostile NPC inventory directly
+        -- E) fallback: nearest NPC inventory (what succeeded in your last test)
         do
-            local list = scanNearbyOnce(10.0, 48)
-            local npc, bestD2
+            local list = scanNearbyOnce(4.0, 24)
+            local npc, d2
             for i = 1, #list do
-                local e = list[i].e
-                if e and (e.class == "NPC" or e.class == "Human" or e.class == "AI") and isDeadEntity(e) then
-                    if not npc or list[i].d2 < bestD2 then npc, bestD2 = e, list[i].d2 end
+                local r = list[i]
+                if r.e and (r.e.class == "NPC" or r.e.class == "Human" or r.e.class == "AI") then
+                    npc, d2 = r.e, r.d2; break
                 end
             end
-            if npc and npc.inventory and type(npc.inventory.GetInventoryTable) == "function" then
-                local ndist = math.sqrt(bestD2 or 0)
-                log(("Fallback NPC-inventory: %s (d=%.2fm)"):format(tostring(npc.GetName and npc:GetName() or "<npc>"),
-                    ndist or -1))
-                local ok, items = pcall(function() return npc.inventory:GetInventoryTable(npc.inventory) end)
-                if ok and type(items) == "table" then
-                    logItemsTable(items, "npc.inventory:GetInventoryTable", 20); return
+            if npc then
+                log(("Fallback NPC-inventory: %s (d=%.2fm)"):format(tostring((npc.GetName and npc:GetName()) or "<npc>"),
+                    math.sqrt(d2 or 0)))
+                local items, how = enumNPCInventory(npc)
+                if items then
+                    logItemsTable(items, how, 25, npc)
+                    nukeNpcInventory(npc, items)
+                else
+                    log(
+                        "Fallback NPC-inventory: no enumerable items (" .. tostring(how) .. ")")
                 end
-                log("Fallback NPC-inventory: enumeration failed")
-            else
-                log("Fallback NPC-inventory: no dead hostile nearby, or no inventory")
             end
         end
 
-        -- F) class-based fallback & retry
-        local stash2, source = resolveCorpseContainer(victim, 10.0)
+        -- F) class-based stash fallback & single retry with probe
+        local stash2, source = resolveCorpseContainer(corpse, 10.0)
         if stash2 then
             log(("Loot container: %s via %s"):format(tostring(stash2:GetName() or "<stash>"), source))
             local swuid2, via2 = getStashInventoryWuid(stash2)
@@ -495,26 +752,26 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
             if swuid2 then
                 local items2, how2 = tryEnumerateByWuid(stash2, swuid2)
                 if items2 then
-                    logItemsTable(items2, how2, 20); return
+                    logItemsTable(items2, how2, 20, corpse); return
                 end
             end
         else
             log("Loot container: <none> near corpse (no StashCorpse; no nearby Stash)")
-            if victim then
-                log("→ Probing neighbors around corpse…"); probeNearVictim(victim, 12.0)
+            if corpse then
+                log("→ Probing neighbors around corpse…"); probeNearVictim(corpse, 12.0)
             end
             later(200, function()
-                local corpse2 = victim or select(1, findNearestCorpse(10.0))
+                local corpse2 = corpse or select(1, findNearestCorpse(10.0))
                 if corpse2 then
-                    local stash3, why3 = resolveCorpseContainerViaOwnership(corpse2, 12.0)
-                    if stash3 then
-                        log(("[retry] Loot container: %s via %s"):format(tostring(stash3:GetName() or "<stash>"), why3))
-                        local w3, lane3 = getStashInventoryWuid(stash3)
+                    local s3, why3 = resolveCorpseContainerViaOwnership(corpse2, 12.0)
+                    if s3 then
+                        log(("[retry] Loot container: %s via %s"):format(tostring(s3:GetName() or "<stash>"), why3))
+                        local w3, lane3 = getStashInventoryWuid(s3)
                         log(("[retry] Stash WUID: %s (via %s)"):format(tostring(w3), tostring(lane3)))
                         if w3 then
-                            local items3, how3 = tryEnumerateByWuid(stash3, w3)
+                            local items3, how3 = tryEnumerateByWuid(s3, w3)
                             if items3 then
-                                logItemsTable(items3, how3, 20); return
+                                logItemsTable(items3, how3, 20, corpse2); return
                             end
                         end
                     else
@@ -558,6 +815,8 @@ function CorpseSanitizer.Bootstrap()
     if CorpseSanitizer.booted then return end
     CorpseSanitizer.booted = true
     log("BOOT ok (version=" .. CorpseSanitizer.version .. ")")
+    logEffectiveConfig()
+
     installLootBeginHook()
     installActorOpenHook()
     log(CorpseSanitizer._loot._orig and "Loot hook: active" or "Loot hook: inactive")
