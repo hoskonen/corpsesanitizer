@@ -1,12 +1,13 @@
 -- CorpseSanitizer.lua (0.2.4) — WUID capture + robust enumeration (read-only, cleaned)
--- Defaults live here
-
-CorpseSanitizer = CorpseSanitizer or {
+-- Module header: must be global so Systems init can see it
+_G.CorpseSanitizer = _G.CorpseSanitizer or {
     version = "0.2.4",
     booted  = false,
     ui      = { active = false },
     _loot   = { lastWUID = nil },
 }
+local CorpseSanitizer = _G.CorpseSanitizer -- shorthand
+
 
 local DEFAULT_CONFIG = {
     dryRun       = false,
@@ -431,99 +432,122 @@ local function enumNPCInventory(npc)
     return nil, "noEnumLane"
 end
 
-local function getNpcInventoryTable(npc)
-    local inv = npc and (npc.inventory or npc.container or npc.stash)
-    if not inv or type(inv) ~= "table" then return nil, "noInventoryComponent" end
-    for _, m in ipairs({ "GetInventoryTable", "GetAllItems", "GetItems" }) do
-        if type(inv[m]) == "function" then
-            local ok, t = pcall(function() return inv[m](inv) end)
-            if ok and type(t) == "table" then return t, "npc." .. m end
-        end
-    end
-    return nil, "noEnumerator"
-end
-
-local function extractDeletionTarget(entry)
-    if type(entry) == "userdata" then return { handle = entry } end
-    if type(entry) == "table" then
-        local handle = entry.id or entry.Id or entry.handle or entry.Handle
-        if handle then return { handle = handle } end
-        local class = entry.class or entry.Class
-        if class then
-            local count = tonumber(entry.amount or entry.Amount or 1) or 1
-            return { class = tostring(class), count = count }
-        end
-    end
-    return nil
-end
-
 -- Remove every item in an NPC's own inventory (NOT the player, NOT allies)
-local function nukeNpcInventory(npc)
-    local tag = (Config and Config.dryRun) and "[nuke][dry]" or "[nuke]"
+-- Remove every item in an NPC's own inventory (NOT the player, NOT allies)
+-- Remove every item in an NPC’s own inventory (NOT the player, NOT allies)
+local function nukeNpcInventory(npc, prelistedItems)
+    local C   = CorpseSanitizer.config or {}
+    local N   = C.nuker or {}
+    local dry = C.dryRun and true or false
+    local tag = dry and "[nuke][dry]" or "[nuke]"
+
+    if not N.enabled then
+        log(tag .. " abort (nuker.enabled=false)"); return
+    end
+    if N.onlyIfCorpse and not (npc and isCorpseEntity(npc)) then
+        log(tag .. " abort (onlyIfCorpse=true and npc is not a corpse)"); return
+    end
     if not npc then
-        log(tag .. " abort (no npc)")
-        return
+        log(tag .. " abort (no npc)"); return
     end
 
-    -- Resolve the NPC's own WUID so we don't accidentally delete someone else's items
-    local npcWuid = getEntityWuid and getEntityWuid(npc) or nil
+    -- Confirm this NPC’s WUID (so we don’t delete someone else’s items)
+    local npcWuid = getEntityWuid and getEntityWuid(npc)
     if not npcWuid then
-        log(tag .. " abort (no npc WUID)")
-        return
+        log(tag .. " abort (no npc WUID)"); return
     end
 
-    -- Try the direct NPC inventory table
-    local inv = npc.inventory
-    if not (inv and type(inv.GetInventoryTable) == "function") then
-        log(tag .. " abort (npc has no enumerable inventory)")
-        return
-    end
-
-    local ok, items = pcall(function() return inv:GetInventoryTable() end)
-    if not (ok and type(items) == "table") then
-        log(tag .. " abort (failed to get inventory list)")
-        return
+    -- Collect items to operate on
+    local items, how
+    if type(prelistedItems) == "table" then
+        items, how = prelistedItems, "prelisted"
+    else
+        local inv = npc.inventory or npc.container or npc.stash
+        if not (inv and type(inv.GetInventoryTable) == "function") then
+            log(tag .. " abort (npc has no enumerable inventory)"); return
+        end
+        local ok, t = pcall(function() return inv:GetInventoryTable(inv) end)
+        if not (ok and type(t) == "table") then
+            log(tag .. " abort (failed to get inventory list)"); return
+        end
+        items, how = t, "inventory:GetInventoryTable"
     end
 
     local deleted, kept = 0, 0
-    -- Deletion order: numeric keys in ascending order (stable)
+
+    -- stable keys
     local keys = {}
-    for k in pairs(items) do if type(k) == "number" then keys[#keys + 1] = k end end
-    table.sort(keys)
+    for k in pairs(items) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b)
+        local na, nb = type(a) == "number", type(b) == "number"
+        if na and nb then return a < b end
+        if na then return true end
+        if nb then return false end
+        return tostring(a) < tostring(b)
+    end)
 
     for _, k in ipairs(keys) do
-        local row = items[k]
-        local h   = itemHandle(row)
-        if not h then
+        local row     = items[k]
+        local it      = resolveItemEntry(row) -- may be nil if row is just a handle
+        local classId = (it and (it.class or it.Class)) or (row and (row.class or row.Class))
+        local handle  = itemHandle(row)
+
+        -- Decide whether to keep this item
+        local keep    = false
+
+        -- 1) Skip money?
+        if N.skipMoney and classId == "5ef63059-322e-4e1b-abe8-926e100c770e" then
+            keep = true
+        end
+
+        -- 2) HP gate (treat >1 as 0-100%)
+        if not keep and it and N.minHp then
+            local rawHp = it.health or it.Health or it.cond
+            if rawHp and rawHp > 1.001 then rawHp = rawHp / 100 end
+            local hp = rawHp or 0
+            if hp < N.minHp then
+                keep = true
+            end
+        end
+
+        -- 3) Ownership check (when we have a handle)
+        if not keep and handle then
+            local ownerWuid = select(1, ownerOfHandle(handle))
+            if ownerWuid and npcWuid and ownerWuid ~= npcWuid then
+                keep = true
+            end
+        end
+
+        if keep then
             kept = kept + 1
         else
-            -- double check ownership so we only touch the NPC's own items
-            local ownerWuid = select(1, ownerOfHandle(h))
-            if ownerWuid and ownerWuid ~= npcWuid then
-                -- belongs to someone else → skip
-                kept = kept + 1
+            if dry then
+                log(string.format("%s Would delete %s (%s)", tag, tostring(classId or "?"), tostring(handle)))
+                deleted = deleted + 1
             else
-                if Config and Config.dryRun then
-                    local classId = (type(row) == "table") and (row.class or row.Class or row.id or row.Id) or "?"
-                    log(string.format("%s Would delete %s (%s)", tag, tostring(classId), tostring(h)))
+                local okDel = false
+                if handle and Inventory and Inventory.DeleteItem then
+                    okDel = pcall(function() return Inventory.DeleteItem(handle, -1) end)
+                elseif classId and Inventory and Inventory.DeleteItemOfClass then
+                    local count = tonumber((it and (it.amount or it.Amount)) or (row and (row.amount or row.Amount)) or
+                    -1) or -1
+                    okDel = pcall(function() return Inventory.DeleteItemOfClass(tostring(classId), count) end)
+                end
+                if okDel then
                     deleted = deleted + 1
                 else
-                    -- real deletion
-                    local okDel, err = pcall(function() return Inventory.DeleteItem(h) end)
-                    if okDel then
-                        deleted = deleted + 1
-                    else
-                        kept = kept + 1
-                        log(string.format("%s delete failed %s (%s): %s", tag,
-                            tostring(row and (row.class or row.Class) or "?"), tostring(h), tostring(err)))
-                    end
+                    kept = kept + 1
+                    log(string.format("%s delete failed %s (%s)", tag, tostring(classId or "?"), tostring(handle)))
                 end
             end
         end
     end
 
-    log(string.format("%s summary: deleted=%d kept=%d dry=%s", tag, deleted, kept, tostring(Config and Config.dryRun)))
+    log(string.format("%s summary: deleted=%d kept=%d dry=%s (via=%s)",
+        tag, deleted, kept, tostring(dry), how))
 end
+
+
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Stash/NPC enumeration lanes
@@ -662,7 +686,7 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
 
             -- A) direct tables on corpse entity
             if tryEnumerateDirectOnEntity(corpse) then
-                if CorpseSanitizer.config.insanityMode then
+                if CorpseSanitizer.config.insanityMode and (CorpseSanitizer.config.nuker and CorpseSanitizer.config.nuker.enabled) then
                     nukeNpcInventory(corpse)
                 else
                     log(
@@ -679,9 +703,6 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
                 if items then
                     logItemsTable(items, how, 20, corpse)
                     nukeNpcInventory(corpse, items)
-                    if CorpseSanitizer.config.nuke and CorpseSanitizer.config.nuke.enabled then
-                        nukeNpcInventory(npc, items)
-                    end
                 end
             end
         else
@@ -735,7 +756,11 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
                 local items, how = enumNPCInventory(npc)
                 if items then
                     logItemsTable(items, how, 25, npc)
-                    nukeNpcInventory(npc, items)
+                    if CorpseSanitizer.config.insanityMode and (CorpseSanitizer.config.nuker and CorpseSanitizer.config.nuker.enabled) then
+                        nukeNpcInventory(npc, items)
+                    else
+                        log("[NUKE] skipped (insanityMode=false or nuker.enabled=false)")
+                    end
                 else
                     log(
                         "Fallback NPC-inventory: no enumerable items (" .. tostring(how) .. ")")
@@ -823,3 +848,8 @@ function CorpseSanitizer.Bootstrap()
     log(CorpseSanitizer._loot._origActor and "Actor hook: active" or "Actor hook: inactive")
     CorpseSanitizer.EnableTransferLogging()
 end
+
+-- ensure global is exported (harmless if already set)
+_G.CorpseSanitizer = CorpseSanitizer
+-- (optional) return the table if the loader ever uses `dofile`
+return CorpseSanitizer

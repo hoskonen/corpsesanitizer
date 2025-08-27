@@ -14,7 +14,7 @@ return {
 
     logging = {
         prettyOwner     = true,
-        probeOnMiss     = true,
+        probeOnMiss     = false,
         showWouldDelete = true,
     },
 }
