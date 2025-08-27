@@ -1,30 +1,21 @@
--- CorpseSanitizer.lua (0.2.4) — WUID capture + robust enumeration (read-only, cleaned)
--- Module header: must be global so Systems init can see it
--- CorpseSanitizer.lua (0.2.5) — ReloadScript-friendly, no returns
+-- Module header: expose ONE global table
+CorpseSanitizer = CorpseSanitizer or {
+    version = "0.2.4",
+    booted  = false,
+    ui      = { active = false },
+    _loot   = { lastWUID = nil },
+}
 
--- 1) Create/restore the single global module table
-local CS = rawget(_G, "CorpseSanitizer")
-if not CS then
-    CS = {}
-    rawset(_G, "CorpseSanitizer", CS)
-end
--- Keep a plain global alias too, so both names work in the rest of the file
-CorpseSanitizer      = CS
-
--- 2) Idempotent fields (ReloadScript won't blow away existing state)
-CS.version           = CS.version or "0.2.5"
-CS.booted            = CS.booted or false
-CS.ui                = CS.ui or { active = false }
-CS._loot             = CS._loot or { lastWUID = nil, _orig = nil, _origActor = nil }
+local CS = CorpseSanitizer
 
 -- 3) Defaults + deep merge (so external config can override selectively)
 local DEFAULT_CONFIG = {
-    dryRun       = true,
-    insanityMode = false,
+    dryRun       = false,
+    insanityMode = true,
     ui           = { movie = "ItemTransfer" },
     proximity    = { radius = 5.0, maxList = 24 },
     nuker        = {
-        enabled      = false,
+        enabled      = true,
         minHp        = 0.00,
         skipMoney    = true,
         onlyIfCorpse = true,
