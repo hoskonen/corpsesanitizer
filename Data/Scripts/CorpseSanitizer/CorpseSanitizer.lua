@@ -1,36 +1,41 @@
 -- CorpseSanitizer.lua (0.2.4) — WUID capture + robust enumeration (read-only, cleaned)
 -- Module header: must be global so Systems init can see it
-_G.CorpseSanitizer = _G.CorpseSanitizer or {
-    version = "0.2.4",
-    booted  = false,
-    ui      = { active = false },
-    _loot   = { lastWUID = nil },
-}
-local CorpseSanitizer = _G.CorpseSanitizer -- shorthand
+-- CorpseSanitizer.lua (0.2.5) — ReloadScript-friendly, no returns
 
+-- 1) Create/restore the single global module table
+local CS = rawget(_G, "CorpseSanitizer")
+if not CS then
+    CS = {}
+    rawset(_G, "CorpseSanitizer", CS)
+end
+-- Keep a plain global alias too, so both names work in the rest of the file
+CorpseSanitizer      = CS
 
+-- 2) Idempotent fields (ReloadScript won't blow away existing state)
+CS.version           = CS.version or "0.2.5"
+CS.booted            = CS.booted or false
+CS.ui                = CS.ui or { active = false }
+CS._loot             = CS._loot or { lastWUID = nil, _orig = nil, _origActor = nil }
+
+-- 3) Defaults + deep merge (so external config can override selectively)
 local DEFAULT_CONFIG = {
-    dryRun       = false,
-    insanityMode = true,
-
+    dryRun       = true,
+    insanityMode = false,
     ui           = { movie = "ItemTransfer" },
     proximity    = { radius = 5.0, maxList = 24 },
-
     nuker        = {
-        enabled      = false, -- set true to allow deletion
-        minHp        = 0.00,  -- delete items with hp >= this (0 deletes everything)
-        skipMoney    = true,  -- keep coins by default
-        onlyIfCorpse = true,  -- only run when a corpse context is detected
+        enabled      = false,
+        minHp        = 0.00,
+        skipMoney    = true,
+        onlyIfCorpse = true,
     },
-
     logging      = {
-        prettyOwner     = true, -- map WUIDs to "player/npc/<wuid>"
-        probeOnMiss     = true, -- probe neighbors when stash detection fails
-        showWouldDelete = true, -- in dryRun, log what would be deleted
+        prettyOwner     = true,
+        probeOnMiss     = true,
+        showWouldDelete = true,
     },
 }
 
--- Deep merge so overrides only replace provided keys
 local function deepMerge(dst, src)
     if type(src) ~= "table" then return dst end
     for k, v in pairs(src) do
@@ -43,26 +48,43 @@ local function deepMerge(dst, src)
     return dst
 end
 
--- Start with defaults
-CorpseSanitizer.config = deepMerge({}, DEFAULT_CONFIG)
-
--- Load external overrides (should return a table!)
-local function loadExternalConfig()
+-- 4) Build effective config (defaults first, then previous in-memory cfg, then external file)
+CS.config = deepMerge({}, DEFAULT_CONFIG) -- start with defaults
+if type(CS.config) == "table" and type(CS._prevCfg) == "table" then
+    deepMerge(CS.config, CS._prevCfg)     -- preserve previous overrides across ReloadScript
+end
+do
     local ok, overrides = pcall(dofile, "Scripts/CorpseSanitizer/CorpseSanitizerConfig.lua")
-    if ok and type(overrides) == "table" then
-        deepMerge(CorpseSanitizer.config, overrides)
-    end
+    if ok and type(overrides) == "table" then deepMerge(CS.config, overrides) end
+end
+CS._prevCfg = CS.config -- snapshot to survive future ReloadScript calls
+
+-- 5) Small helpers available everywhere below
+local function log(msg) System.LogAlways("[CorpseSanitizer] " .. tostring(msg)) end
+local function bool(x) return x and "true" or "false" end
+local function logEffectiveConfig()
+    local c, n, l, p, u = CS.config, (CS.config.nuker or {}), (CS.config.logging or {}), (CS.config.proximity or {}),
+        (CS.config.ui or {})
+    log(string.format(
+        "cfg: dryRun=%s | insanityMode=%s | ui.movie=%s | radius=%.2f | nuker{enabled=%s,minHp=%.2f,skipMoney=%s,onlyIfCorpse=%s} | logging{prettyOwner=%s,probeOnMiss=%s,showWouldDelete=%s}",
+        bool(c.dryRun), bool(c.insanityMode),
+        tostring(u.movie or "?"),
+        tonumber(p.radius or 0) or 0,
+        bool(n.enabled), tonumber(n.minHp or 0) or 0,
+        bool(n.skipMoney), bool(n.onlyIfCorpse),
+        bool(l.prettyOwner), bool(l.probeOnMiss), bool(l.showWouldDelete)))
 end
 
--- Public helper so you can reload in-game if needed
-function CorpseSanitizer.ReloadConfig()
-    CorpseSanitizer.config = deepMerge({}, DEFAULT_CONFIG)
-    loadExternalConfig()
+-- 6) Public: allow in-game reload of external overrides
+function CS.ReloadConfig()
+    CS._prevCfg = CS.config -- keep current as baseline
+    CS.config = deepMerge({}, DEFAULT_CONFIG)
+    deepMerge(CS.config, CS._prevCfg)
+    local ok, overrides = pcall(dofile, "Scripts/CorpseSanitizer/CorpseSanitizerConfig.lua")
+    if ok and type(overrides) == "table" then deepMerge(CS.config, overrides) end
+    log("[config] reloaded")
+    logEffectiveConfig()
 end
-
--- Load once at boot
-loadExternalConfig()
-
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Utilities
@@ -530,7 +552,7 @@ local function nukeNpcInventory(npc, prelistedItems)
                     okDel = pcall(function() return Inventory.DeleteItem(handle, -1) end)
                 elseif classId and Inventory and Inventory.DeleteItemOfClass then
                     local count = tonumber((it and (it.amount or it.Amount)) or (row and (row.amount or row.Amount)) or
-                    -1) or -1
+                        -1) or -1
                     okDel = pcall(function() return Inventory.DeleteItemOfClass(tostring(classId), count) end)
                 end
                 if okDel then
@@ -848,8 +870,3 @@ function CorpseSanitizer.Bootstrap()
     log(CorpseSanitizer._loot._origActor and "Actor hook: active" or "Actor hook: inactive")
     CorpseSanitizer.EnableTransferLogging()
 end
-
--- ensure global is exported (harmless if already set)
-_G.CorpseSanitizer = CorpseSanitizer
--- (optional) return the table if the loader ever uses `dofile`
-return CorpseSanitizer
