@@ -1,6 +1,6 @@
 -- Module header: expose ONE global table
 CorpseSanitizer = CorpseSanitizer or {
-    version = "0.2.4",
+    version = "0.3.0",
     booted  = false,
     ui      = { active = false },
     _loot   = { lastWUID = nil },
@@ -12,22 +12,33 @@ local CS = CorpseSanitizer
 local DEFAULT_CONFIG = {
     dryRun       = false,
     insanityMode = true,
-    ui           = { movie = "ItemTransfer" },
-    proximity    = { radius = 5.0, maxList = 24 },
-    nuker        = {
-        enabled      = true,
-        minHp        = 0.00,
-        skipMoney    = true,
-        onlyIfCorpse = true,
+
+    ui           = {
+        movie        = "ItemTransfer",
+        shadowDelete = true, -- set true in external config if you want UI-only purge when engine blocks writes
     },
+
+    proximity    = { radius = 3.0, maxList = 24 },
+
+    nuker        = {
+        enabled             = true,
+        minHp               = 0.00,
+        skipMoney           = true,
+        onlyIfCorpse        = true,
+        unequipBeforeDelete = true, -- NEW: try unequip → delete for dead-NPC gear
+    },
+
     logging      = {
         prettyOwner     = true,
         probeOnMiss     = true,
         showWouldDelete = true,
+        nuker           = true,
     },
 }
 
+
 local function deepMerge(dst, src)
+    if type(dst) ~= "table" then dst = {} end
     if type(src) ~= "table" then return dst end
     for k, v in pairs(src) do
         if type(v) == "table" and type(dst[k]) == "table" then
@@ -41,7 +52,7 @@ end
 
 -- 4) Build effective config (defaults first, then previous in-memory cfg, then external file)
 CS.config = deepMerge({}, DEFAULT_CONFIG) -- start with defaults
-if type(CS.config) == "table" and type(CS._prevCfg) == "table" then
+if type(CS._prevCfg) == "table" then
     deepMerge(CS.config, CS._prevCfg)     -- preserve previous overrides across ReloadScript
 end
 do
@@ -53,17 +64,23 @@ CS._prevCfg = CS.config -- snapshot to survive future ReloadScript calls
 -- 5) Small helpers available everywhere below
 local function log(msg) System.LogAlways("[CorpseSanitizer] " .. tostring(msg)) end
 local function bool(x) return x and "true" or "false" end
+
 local function logEffectiveConfig()
-    local c, n, l, p, u = CS.config, (CS.config.nuker or {}), (CS.config.logging or {}), (CS.config.proximity or {}),
-        (CS.config.ui or {})
+    local c    = CS.config
+    local nuk  = c.nuker or {}
+    local lg   = c.logging or {}
+    local prox = c.proximity or {}
+    local ui   = c.ui or {}
+
     log(string.format(
-        "cfg: dryRun=%s | insanityMode=%s | ui.movie=%s | radius=%.2f | nuker{enabled=%s,minHp=%.2f,skipMoney=%s,onlyIfCorpse=%s} | logging{prettyOwner=%s,probeOnMiss=%s,showWouldDelete=%s}",
+        "cfg: dryRun=%s | insanityMode=%s | ui.movie=%s | ui.shadowDelete=%s | radius=%.2f | nuker{enabled=%s,minHp=%.2f,skipMoney=%s,onlyIfCorpse=%s} | logging{prettyOwner=%s,probeOnMiss=%s,showWouldDelete=%s,nuker=%s}",
         bool(c.dryRun), bool(c.insanityMode),
-        tostring(u.movie or "?"),
-        tonumber(p.radius or 0) or 0,
-        bool(n.enabled), tonumber(n.minHp or 0) or 0,
-        bool(n.skipMoney), bool(n.onlyIfCorpse),
-        bool(l.prettyOwner), bool(l.probeOnMiss), bool(l.showWouldDelete)))
+        tostring(ui.movie or "?"), bool(ui.shadowDelete),
+        tonumber(prox.radius or 0) or 0,
+        bool(nuk.enabled), tonumber(nuk.minHp or 0) or 0,
+        bool(nuk.skipMoney), bool(nuk.onlyIfCorpse),
+        bool(lg.prettyOwner), bool(lg.probeOnMiss), bool(lg.showWouldDelete), bool(lg.nuker)
+    ))
 end
 
 -- 6) Public: allow in-game reload of external overrides
@@ -80,8 +97,6 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Utilities
 -- ─────────────────────────────────────────────────────────────────────────────
-local function log(msg) System.LogAlways("[CorpseSanitizer] " .. tostring(msg)) end
-
 local function getPlayer()
     return System.GetEntityByName("player")
         or System.GetEntityByName("Henry")
@@ -117,26 +132,6 @@ local function later(ms, fn)
     end)
 end
 
-local function bool(x) return x and "true" or "false" end
-
-local function logEffectiveConfig()
-    local c    = CorpseSanitizer.config
-    local nuk  = c.nuker or {}
-    local lg   = c.logging or {}
-    local prox = c.proximity or {}
-    local ui   = c.ui or {}
-
-    log(string.format(
-        "cfg: dryRun=%s | insanityMode=%s | ui.movie=%s | radius=%.2f | nuker{enabled=%s,minHp=%.2f,skipMoney=%s,onlyIfCorpse=%s} | logging{prettyOwner=%s,probeOnMiss=%s,showWouldDelete=%s}",
-        bool(c.dryRun), bool(c.insanityMode),
-        tostring(ui.movie or "?"),
-        tonumber(prox.radius or 0) or 0,
-        bool(nuk.enabled), tonumber(nuk.minHp or 0) or 0,
-        bool(nuk.skipMoney), bool(nuk.onlyIfCorpse),
-        bool(lg.prettyOwner), bool(lg.probeOnMiss), bool(lg.showWouldDelete)
-    ))
-end
-
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Engine plumbing: WUID/Owner helpers
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -156,26 +151,34 @@ local function getInventoryOwner(wuid)
     return nil
 end
 
-local _ownerPrettyCache = {}
 local function prettyOwner(ownerWuid, victim)
     if not ownerWuid or tostring(ownerWuid) == "userdata: 0000000000000000" then
         return "none/unknown"
     end
-    -- victim?
     local vw = victim and getEntityWuid and getEntityWuid(victim)
     if vw and ownerWuid == vw then return "victim" end
-    -- player?
-    local p = System.GetEntityByName("player") or System.GetEntityByName("Henry") or System.GetEntityByName("dude")
+    local p = getPlayer()
     local pw = p and getEntityWuid and getEntityWuid(p)
     if pw and ownerWuid == pw then return "player" end
-    -- default short form
     return tostring(ownerWuid)
 end
-
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Corpse/NPC inspection + stash resolution
 -- ─────────────────────────────────────────────────────────────────────────────
+local function isEntityDead(e)
+    if not e then return false end
+    if e.actor and type(e.actor.IsDead) == "function" then
+        local ok, res = pcall(e.actor.IsDead, e.actor)
+        if ok and res then return true end
+    end
+    if type(e.GetHealth) == "function" then
+        local ok, h = pcall(e.GetHealth, e)
+        if ok and type(h) == "number" and h <= 0 then return true end
+    end
+    return false
+end
+
 local function isCorpseEntity(e)
     if not e then return false end
     local cls = tostring(e.class or "")
@@ -183,7 +186,10 @@ local function isCorpseEntity(e)
         or cls == "SO_DeadBody_Human" or cls == "SO_DeadBody_Human_Interactable" then
         return true
     end
-    return cls:find("DeadBody", 1, true) ~= nil
+    if cls:find("DeadBody", 1, true) ~= nil then return true end
+    -- Treat dead NPCs as 'corpse-like' for our purposes (bosses may stay NPC class)
+    if isEntityDead(e) then return true end
+    return false
 end
 
 local function findNearestCorpse(radius)
@@ -268,22 +274,34 @@ local function resolveCorpseContainerViaOwnership(victim, radius)
     return nil, "noOwnerMatch"
 end
 
--- Return true if 'entry' is a handle we can pass to Inventory.DeleteItem
-local function itemHandle(entry)
-    if type(entry) == "userdata" then return entry end
-    if type(entry) == "table" then
-        -- Some lists put the handle at .id / .Id
-        return entry.id or entry.Id or entry.handle or nil
+-- Try to unequip a handle before deletion
+local function TryUnequip(subject, ownerWuid, handle)
+    if not handle then return false end
+    local lanes = {
+        { "Inventory",    "UnequipItem" }, { "Inventory", "UnEquipItem" },
+        { "EntityModule", "UnequipItem" }, { "EntityModule", "UnEquipItem" },
+        { "Equipment", "UnequipItem" }, { "EquipmentModule", "UnequipItem" },
+    }
+    for i = 1, #lanes do
+        local M, fn = _G[lanes[i][1]], lanes[i][2]
+        if M and type(M[fn]) == "function" and ownerWuid then
+            local ok = pcall(M[fn], ownerWuid, handle)
+            if ok then return true, lanes[i][1] .. "." .. fn end
+        end
     end
-    return nil
-end
-
--- Get the WUID that owns a *handle* (fast, no resolution to item table)
-local function ownerOfHandle(h)
-    if not (h and ItemManager and ItemManager.GetItemOwner) then return nil, "no-handle" end
-    local ok, w = pcall(ItemManager.GetItemOwner, h)
-    if ok and w then return w, "ItemManager.GetItemOwner(handle)" end
-    return nil, "no-owner"
+    -- component-level fallbacks
+    for _, compName in ipairs({ "inventory", "container", "stash" }) do
+        local comp = subject and subject[compName]
+        if type(comp) == "table" then
+            for _, fn in ipairs({ "Unequip", "UnEquip", "UnequipItem", "UnEquipItem" }) do
+                if type(comp[fn]) == "function" then
+                    local ok = pcall(comp[fn], comp, handle)
+                    if ok then return true, "subject." .. compName .. ":" .. fn end
+                end
+            end
+        end
+    end
+    return false
 end
 
 
@@ -300,17 +318,14 @@ end
 
 -- Try to resolve item owner from an entry that might be a handle or table
 local function resolveItemOwner(entry)
-    -- If entry is an item handle (userdata), prefer ItemManager.GetItemOwner(handle)
     if type(entry) == "userdata" and ItemManager and ItemManager.GetItemOwner then
         local ok, w = pcall(ItemManager.GetItemOwner, entry)
         if ok and w then return w, "ItemManager.GetItemOwner(handle)" end
     end
-    -- If entry is a table already, see if it carries an owner field (rare)
     if type(entry) == "table" then
         if entry.owner or entry.Owner then
             return entry.owner or entry.Owner, "entry.owner"
         end
-        -- Some frameworks keep a backref from item to inventory/container
         if entry.GetLinkedOwner and type(entry.GetLinkedOwner) == "function" then
             local ok2, w2 = pcall(entry.GetLinkedOwner, entry)
             if ok2 and w2 then return w2, "item:GetLinkedOwner()" end
@@ -319,26 +334,22 @@ local function resolveItemOwner(entry)
     return nil, "none"
 end
 
-
 local function getItemOwnerWuid(entry)
     if type(entry) == "userdata" and ItemManager and ItemManager.GetItemOwner then
         local ok, w = pcall(ItemManager.GetItemOwner, entry); if ok and w then
-            return w,
-                "ItemManager.GetItemOwner(handle)"
+            return w, "ItemManager.GetItemOwner(handle)"
         end
     end
     if type(entry) == "table" and ItemManager and ItemManager.GetItemOwner then
         local id = entry.id or entry.Id
         if id then
             local ok, w = pcall(ItemManager.GetItemOwner, id); if ok and w then
-                return w,
-                    "ItemManager.GetItemOwner(row.id)"
+                return w, "ItemManager.GetItemOwner(row.id)"
             end
         end
         if type(entry.GetLinkedOwner) == "function" then
             local ok, w = pcall(function() return entry:GetLinkedOwner() end); if ok and w then
-                return w,
-                    "item:GetLinkedOwner()"
+                return w, "item:GetLinkedOwner()"
             end
         end
     end
@@ -414,7 +425,7 @@ local function probeNearVictim(victim, radius)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- NPC inventory lanes (read-only) + destructive (nuke) with dry-run
+-- Stash/NPC enumeration lanes (kept from earlier)
 -- ─────────────────────────────────────────────────────────────────────────────
 local function enumNPCInventory(npc)
     if not npc then return nil, "noNPC" end
@@ -445,128 +456,8 @@ local function enumNPCInventory(npc)
     return nil, "noEnumLane"
 end
 
--- Remove every item in an NPC's own inventory (NOT the player, NOT allies)
--- Remove every item in an NPC's own inventory (NOT the player, NOT allies)
--- Remove every item in an NPC’s own inventory (NOT the player, NOT allies)
-local function nukeNpcInventory(npc, prelistedItems)
-    local C   = CorpseSanitizer.config or {}
-    local N   = C.nuker or {}
-    local dry = C.dryRun and true or false
-    local tag = dry and "[nuke][dry]" or "[nuke]"
-
-    if not N.enabled then
-        log(tag .. " abort (nuker.enabled=false)"); return
-    end
-    if N.onlyIfCorpse and not (npc and isCorpseEntity(npc)) then
-        log(tag .. " abort (onlyIfCorpse=true and npc is not a corpse)"); return
-    end
-    if not npc then
-        log(tag .. " abort (no npc)"); return
-    end
-
-    -- Confirm this NPC’s WUID (so we don’t delete someone else’s items)
-    local npcWuid = getEntityWuid and getEntityWuid(npc)
-    if not npcWuid then
-        log(tag .. " abort (no npc WUID)"); return
-    end
-
-    -- Collect items to operate on
-    local items, how
-    if type(prelistedItems) == "table" then
-        items, how = prelistedItems, "prelisted"
-    else
-        local inv = npc.inventory or npc.container or npc.stash
-        if not (inv and type(inv.GetInventoryTable) == "function") then
-            log(tag .. " abort (npc has no enumerable inventory)"); return
-        end
-        local ok, t = pcall(function() return inv:GetInventoryTable(inv) end)
-        if not (ok and type(t) == "table") then
-            log(tag .. " abort (failed to get inventory list)"); return
-        end
-        items, how = t, "inventory:GetInventoryTable"
-    end
-
-    local deleted, kept = 0, 0
-
-    -- stable keys
-    local keys = {}
-    for k in pairs(items) do keys[#keys + 1] = k end
-    table.sort(keys, function(a, b)
-        local na, nb = type(a) == "number", type(b) == "number"
-        if na and nb then return a < b end
-        if na then return true end
-        if nb then return false end
-        return tostring(a) < tostring(b)
-    end)
-
-    for _, k in ipairs(keys) do
-        local row     = items[k]
-        local it      = resolveItemEntry(row) -- may be nil if row is just a handle
-        local classId = (it and (it.class or it.Class)) or (row and (row.class or row.Class))
-        local handle  = itemHandle(row)
-
-        -- Decide whether to keep this item
-        local keep    = false
-
-        -- 1) Skip money?
-        if N.skipMoney and classId == "5ef63059-322e-4e1b-abe8-926e100c770e" then
-            keep = true
-        end
-
-        -- 2) HP gate (treat >1 as 0-100%)
-        if not keep and it and N.minHp then
-            local rawHp = it.health or it.Health or it.cond
-            if rawHp and rawHp > 1.001 then rawHp = rawHp / 100 end
-            local hp = rawHp or 0
-            if hp < N.minHp then
-                keep = true
-            end
-        end
-
-        -- 3) Ownership check (when we have a handle)
-        if not keep and handle then
-            local ownerWuid = select(1, ownerOfHandle(handle))
-            if ownerWuid and npcWuid and ownerWuid ~= npcWuid then
-                keep = true
-            end
-        end
-
-        if keep then
-            kept = kept + 1
-        else
-            if dry then
-                log(string.format("%s Would delete %s (%s)", tag, tostring(classId or "?"), tostring(handle)))
-                deleted = deleted + 1
-            else
-                local okDel = false
-                if handle and Inventory and Inventory.DeleteItem then
-                    okDel = pcall(function() return Inventory.DeleteItem(handle, -1) end)
-                elseif classId and Inventory and Inventory.DeleteItemOfClass then
-                    local count = tonumber((it and (it.amount or it.Amount)) or (row and (row.amount or row.Amount)) or
-                        -1) or -1
-                    okDel = pcall(function() return Inventory.DeleteItemOfClass(tostring(classId), count) end)
-                end
-                if okDel then
-                    deleted = deleted + 1
-                else
-                    kept = kept + 1
-                    log(string.format("%s delete failed %s (%s)", tag, tostring(classId or "?"), tostring(handle)))
-                end
-            end
-        end
-    end
-
-    log(string.format("%s summary: deleted=%d kept=%d dry=%s (via=%s)",
-        tag, deleted, kept, tostring(dry), how))
-end
-
-
-
--- ─────────────────────────────────────────────────────────────────────────────
--- Stash/NPC enumeration lanes
--- ─────────────────────────────────────────────────────────────────────────────
 local function tryEnumerateDirectOnEntity(ent)
-    if not ent then return false end
+    if not ent then return nil, "no-entity" end
     for _, comp in ipairs({ "inventory", "container", "stash" }) do
         local c = ent[comp]
         if type(c) == "table" then
@@ -575,14 +466,13 @@ local function tryEnumerateDirectOnEntity(ent)
                     local ok, items = pcall(function() return c[m](c) end)
                     if ok and type(items) == "table" then
                         log(string.format("Direct: %s:%s → table(#%d)", comp, m, #items))
-                        logItemsTable(items, comp .. ":" .. m, 20, ent)
-                        return true
+                        return items, comp .. ":" .. m
                     end
                 end
             end
         end
     end
-    return false
+    return nil, "noDirectLane"
 end
 
 local function tryEnumerateByWuid(stashEntOrNpc, wuid)
@@ -650,36 +540,455 @@ local function getStashInventoryWuid(stashEnt)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Hooks
+-- UI refresh broker for ItemTransfer.gfx
 -- ─────────────────────────────────────────────────────────────────────────────
-local function installLootBeginHook()
-    if not (XGenAIModule and type(XGenAIModule.LootInventoryBegin) == "function") then
-        log("Loot hook: XGenAIModule.LootInventoryBegin not available"); return
-    end
-    if CorpseSanitizer._loot._orig then return end
-    CorpseSanitizer._loot._orig = XGenAIModule.LootInventoryBegin
-    XGenAIModule.LootInventoryBegin = function(wuid, ...)
-        CorpseSanitizer._loot.lastWUID = wuid
-        log("Loot hook: LootInventoryBegin wuid=" .. tostring(wuid))
-        return CorpseSanitizer._loot._orig(wuid, ...)
-    end
-    log("Loot hook: installed on XGenAIModule.LootInventoryBegin")
+local UIRefresh = {
+    movie = "ItemTransfer",
+    tried = false,
+    ok    = {},
+}
+
+local function ui_call(movie, pathOrFn, maybeFn, ...)
+    if not (UIAction and UIAction.CallFunction) then return false end
+    local ok = false
+    -- try 3-seg (movie, path, fn)
+    if maybeFn then ok = pcall(UIAction.CallFunction, movie, pathOrFn, maybeFn, ...) or ok end
+    -- try 2-seg (movie, fn)
+    ok = pcall(UIAction.CallFunction, movie, pathOrFn, ...) or ok
+    return ok
 end
 
-local function installActorOpenHook()
-    local p = getPlayer(); local act = p and p.actor
-    if not (act and type(act.OpenItemTransferStore) == "function") then
-        log("Actor hook: OpenItemTransferStore not available"); return
+local function ui_try(path, fn, ...)
+    local sig2 = path .. "::" .. (fn or "<root>")
+    local worked = ui_call(UIRefresh.movie, path, fn, ...)
+    if worked then
+        UIRefresh.ok[sig2] = true; System.LogAlways("[CorpseSanitizer/UI] OK " .. sig2)
     end
-    if CorpseSanitizer._loot._origActor then return end
-    CorpseSanitizer._loot._origActor = act.OpenItemTransferStore
-    act.OpenItemTransferStore = function(self, ownerId, wuid, ...)
-        CorpseSanitizer._loot.lastWUID    = wuid
-        CorpseSanitizer._loot.lastOwnerId = ownerId
-        log(("Actor hook: OpenItemTransferStore owner=%s wuid=%s"):format(tostring(ownerId), tostring(wuid)))
-        return CorpseSanitizer._loot._origActor(self, ownerId, wuid, ...)
+    return worked
+end
+
+function UIRefresh:Probe()
+    if self.tried then return end
+    self.tried = true
+    local paths = { "ItemTransfer", "ApseInventoryList", "InventoryView" }
+    local tries = {
+        { "ClearItems" }, { "Clear" }, { "InvalidateData" },
+        { "OnViewChanged", 0 }, { "OnViewChanged", 1 },
+        { "RequestData" }, { "RefreshData" }, { "ForceRefresh" }, { "Update" },
+    }
+    for i = 1, #paths do
+        for j = 1, #tries do
+            local fn = tries[j][1]
+            if tries[j][2] == nil then ui_try(paths[i], fn) else ui_try(paths[i], fn, tries[j][2]) end
+        end
     end
-    log("Actor hook: installed on actor.OpenItemTransferStore")
+    -- Also test event path for OnViewChanged
+    if UIAction and UIAction.SendEvent then
+        pcall(UIAction.SendEvent, self.movie, "OnViewChanged", { 0 })
+        pcall(UIAction.SendEvent, self.movie, "OnViewChanged", { 1 })
+    end
+end
+
+function UIRefresh:Refresh()
+    self:Probe()
+    local function call(path, fn, ...)
+        local sig = path .. "::" .. fn
+        if self.ok[sig] then pcall(UIAction.CallFunction, self.movie, path, fn, ...) end
+        -- also try short form
+        if self.ok[sig] then pcall(UIAction.CallFunction, self.movie, fn, ...) end
+    end
+    call("ItemTransfer", "ClearItems")
+    call("ApseInventoryList", "Clear")
+    call("InventoryView", "InvalidateData")
+    call("ItemTransfer", "OnViewChanged", 0)
+    call("ItemTransfer", "OnViewChanged", 1)
+    call("ApseInventoryList", "OnViewChanged", 0)
+    call("ApseInventoryList", "OnViewChanged", 1)
+    call("ItemTransfer", "RefreshData")
+    call("InventoryView", "Update")
+    if UIAction and UIAction.SendEvent then
+        pcall(UIAction.SendEvent, self.movie, "OnViewChanged", { 0 })
+        pcall(UIAction.SendEvent, self.movie, "OnViewChanged", { 1 })
+    end
+end
+
+local function ui_remove_row(idStr)
+    ui_try("ItemTransfer", "RemoveItemById", idStr)
+    ui_try("ApseInventoryList", "RemoveItemById", idStr)
+    ui_try("ItemTransfer", "RemoveItem", idStr)
+    ui_try("ApseInventoryList", "fc_removeItem", idStr)
+end
+
+-- helper used when we capture handles
+local function uiIdFromHandle(h)
+    return (tostring(h):gsub("^userdata:%s*", ""))
+end
+
+local function uiIdFromRow(row)
+    if type(row) == "userdata" then return uiIdFromHandle(row) end
+    if type(row) == "table" then
+        local id = row.id or row.Id or row.stackId or row.StackId or row.handle or row.Handle
+        if id ~= nil then return tostring(id) end
+    end
+    return nil
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Delete lanes
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Low-level delete lanes: NO unequip and NO recursion here.
+-- Returns: success:boolean, via:string, attempts:number
+local function tryDeleteForSubject(subject, handle, class, count)
+    count = (count ~= nil) and count or -1
+
+    local function call_success(ok, ret)
+        if not ok then return false end
+        local t = type(ret)
+        if t == "boolean" then
+            return ret
+        elseif t == "number" then
+            return ret ~= 0
+        else
+            return true -- many engine funcs return nil on success
+        end
+    end
+
+    local function try_variants(target, fname, variants, isMethod)
+        local f = target and target[fname]
+        if type(f) ~= "function" then return false, nil, 0 end
+        for i = 1, #variants do
+            local args = variants[i]
+            local ok, ret
+            if isMethod then
+                ok, ret = pcall(f, target, unpack(args))
+            else
+                ok, ret = pcall(f, unpack(args))
+            end
+            if call_success(ok, ret) then
+                local arglist = {}
+                for j = 1, #args do arglist[j] = tostring(args[j]) end
+                return true, string.format("%s(%s)", fname, table.concat(arglist, ",")), i
+            end
+        end
+        return false, nil, #variants
+    end
+
+    local attempts = 0
+
+    -- 1) subject component-local lanes
+    for _, compName in ipairs({ "inventory", "container", "stash" }) do
+        local comp = subject and subject[compName]
+        if type(comp) == "table" then
+            if handle ~= nil then
+                local fnames = { "DeleteItem", "RemoveItem", "DeleteItemById", "RemoveItemById", "DeleteById",
+                    "RemoveById", "DeleteStack", "RemoveStack" }
+                local variants = { { handle, count }, { handle } }
+                for _, fn in ipairs(fnames) do
+                    local okc, via = try_variants(comp, fn, variants, true)
+                    attempts = attempts + #variants
+                    if okc then return true, ("subject.%s:%s"):format(compName, via), attempts end
+                end
+            end
+            if class ~= nil then
+                local fnamesC = { "DeleteItemOfClass", "RemoveItemOfClass", "DeleteClass", "RemoveClass", "DeleteByClass",
+                    "RemoveByClass" }
+                local variantsC = { { tostring(class), count }, { tostring(class) } }
+                for _, fn in ipairs(fnamesC) do
+                    local okc, via = try_variants(comp, fn, variantsC, true)
+                    attempts = attempts + #variantsC
+                    if okc then return true, ("subject.%s:%s"):format(compName, via), attempts end
+                end
+            end
+        end
+    end
+
+    -- 2) owner/WUID-aware modules
+    local ownerWuid
+    if handle and ItemManager and ItemManager.GetItemOwner then
+        local ok, w = pcall(ItemManager.GetItemOwner, handle)
+        if ok and w then ownerWuid = w end
+    end
+    if not ownerWuid and subject then ownerWuid = getEntityWuid(subject) end
+
+    local moduleSets = {
+        { mod = "EntityModule",    H = { "DeleteItem", "RemoveItem", "Delete", "Remove", "DeleteById", "RemoveById" }, C = { "DeleteItemOfClass", "RemoveItemOfClass", "DeleteClass", "RemoveClass", "DeleteByClass", "RemoveByClass" } },
+        { mod = "InventoryModule", H = { "DeleteItem", "RemoveItem", "Delete", "Remove", "DeleteById", "RemoveById" }, C = { "DeleteItemOfClass", "RemoveItemOfClass", "DeleteClass", "RemoveClass", "DeleteByClass", "RemoveByClass" } },
+        { mod = "XGenAIModule",    H = { "DeleteItem", "RemoveItem", "Delete", "Remove", "DeleteById", "RemoveById" }, C = { "DeleteItemOfClass", "RemoveItemOfClass", "DeleteClass", "RemoveClass", "DeleteByClass", "RemoveByClass" } },
+        { mod = "Inventory",       H = { "DeleteItem", "RemoveItem", "Delete", "Remove", "DeleteById", "RemoveById" }, C = { "DeleteItemOfClass", "RemoveItemOfClass", "DeleteClass", "RemoveClass" } },
+    }
+
+    if ownerWuid then
+        for _, set in ipairs(moduleSets) do
+            local M = _G[set.mod]
+            if M then
+                if handle ~= nil then
+                    local variantsH = { { ownerWuid, handle, count }, { ownerWuid, handle } }
+                    for _, fn in ipairs(set.H) do
+                        if type(M[fn]) == "function" then
+                            local okm, via = try_variants(M, fn, variantsH, false)
+                            attempts = attempts + #variantsH
+                            if okm then return true, ("%s.%s"):format(set.mod, via), attempts end
+                        end
+                    end
+                end
+                if class ~= nil then
+                    local variantsC = { { ownerWuid, tostring(class), count }, { ownerWuid, tostring(class) } }
+                    for _, fn in ipairs(set.C) do
+                        if type(M[fn]) == "function" then
+                            local okm, via = try_variants(M, fn, variantsC, false)
+                            attempts = attempts + #variantsC
+                            if okm then return true, ("%s.%s"):format(set.mod, via), attempts end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- 3) global Inventory.* last resort (no owner)
+    if Inventory then
+        if handle then
+            local variantsIH = { { handle, count }, { handle } }
+            for _, fn in ipairs({ "DeleteItem", "RemoveItem", "DeleteById", "RemoveById", "DeleteStack", "RemoveStack" }) do
+                if type(Inventory[fn]) == "function" then
+                    local okI, via = try_variants(Inventory, fn, variantsIH, false)
+                    attempts = attempts + #variantsIH
+                    if okI then return true, ("Inventory.%s"):format(via), attempts end
+                end
+            end
+        end
+        if class then
+            local variantsIC = { { tostring(class), count }, { tostring(class) } }
+            for _, fn in ipairs({ "DeleteItemOfClass", "RemoveItemOfClass", "DeleteClass", "RemoveClass" }) do
+                if type(Inventory[fn]) == "function" then
+                    local okI, via = try_variants(Inventory, fn, variantsIC, false)
+                    attempts = attempts + #variantsIC
+                    if okI then return true, ("Inventory.%s"):format(via), attempts end
+                end
+            end
+        end
+    end
+
+    return false, "no-lane-succeeded", attempts
+end
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Nuker with verification + UI fallback
+-- ─────────────────────────────────────────────────────────────────────────────
+local function countKeys(t)
+    local n = 0; for _ in pairs(t or {}) do n = n + 1 end; return n
+end
+
+local function enumSubject(subject)
+    -- prefer local inventory component
+    local inv = subject and (subject.inventory or subject.container or subject.stash)
+    if inv and type(inv.GetInventoryTable) == "function" then
+        local ok, t = pcall(function() return inv:GetInventoryTable(inv) end)
+        if ok and type(t) == "table" then return t, "inventory:GetInventoryTable" end
+    end
+    -- fallback to WUID/module lanes
+    return enumNPCInventory(subject)
+end
+
+local function nukerLog(msg)
+    if CS.config and CS.config.logging and CS.config.logging.nuker then
+        System.LogAlways("[CorpseSanitizer/Nuke] " .. tostring(msg))
+    end
+end
+
+local function nukeNpcInventory(subject, ctx)
+    ctx       = ctx or {}
+    local C   = CS.config or {}
+    local N   = (C.nuker or {})
+    local dry = C.dryRun and true or false
+    local tag = dry and "[nuke][dry]" or "[nuke]"
+
+    if not N.enabled then
+        nukerLog(tag .. " abort (nuker.enabled=false)"); return
+    end
+    if not subject then
+        nukerLog(tag .. " abort (no subject)"); return
+    end
+
+    local isCorpse   = subject and isCorpseEntity(subject) or false
+    local allowByCtx = ctx.corpseCtx == true
+    if N.onlyIfCorpse and not (isCorpse or allowByCtx) then
+        nukerLog(tag .. " abort (onlyIfCorpse=true, no corpseCtx)"); return
+    end
+
+    local subjectWuid = getEntityWuid and getEntityWuid(subject) or nil
+    if not subjectWuid then
+        nukerLog(tag .. " abort (no subject WUID)"); return
+    end
+
+    -- acquire items if not provided
+    local items, how = ctx.items, "prelisted"
+    if type(items) ~= "table" then items, how = enumSubject(subject) end
+    if type(items) ~= "table" then
+        nukerLog(tag .. " abort (no enumerable inventory)"); return
+    end
+
+    -- snapshot BEFORE
+    local beforeCount = countKeys(items)
+    nukerLog(("Before: %d items (via=%s)"):format(beforeCount, tostring(how)))
+    if beforeCount == 0 then
+        UIRefresh.movie = (C.ui and C.ui.movie) or "ItemTransfer"; UIRefresh:Refresh(); return true
+    end
+
+    -- deterministic key walk
+    local keys = {}; for k in pairs(items) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b)
+        local na, nb = type(a) == "number", type(b) == "number"
+        if na and nb then return a < b end
+        if na then return true end
+        if nb then return false end
+        return tostring(a) < tostring(b)
+    end)
+
+    local deleted, kept = 0, 0
+    local removedIds = {}
+    local uiIds = {}
+
+    for _, k in ipairs(keys) do
+        repeat
+            local row    = items[k]
+            local it     = resolveItemEntry(row) -- may be nil
+            local class  = (it and (it.class or it.Class)) or (row and (row.class or row.Class))
+            local handle = (type(row) == "userdata") and row
+                or (type(row) == "table" and (row.id or row.Id or row.handle or row.Handle))
+                or nil
+
+            -- optional keep-money (class GUID from your earlier build)
+            if (N.skipMoney) and class == "5ef63059-322e-4e1b-abe8-926e100c770e" then
+                kept = kept + 1; break
+            end
+
+            -- optional HP gate
+            if it and N.minHp then
+                local hp = it.health or it.Health or it.cond; if hp and hp > 1.001 then hp = hp / 100 end
+                if (hp or 0) < N.minHp then
+                    kept = kept + 1; break
+                end
+            end
+
+            -- owner must match the victim if provided
+            if handle and ItemManager and ItemManager.GetItemOwner and ctx.victim then
+                local okO, owner = pcall(ItemManager.GetItemOwner, handle)
+                if okO and owner then
+                    local vW = getEntityWuid(ctx.victim)
+                    if vW and owner ~= vW then
+                        kept = kept + 1; break
+                    end
+                end
+            end
+
+            -- delete phase
+            local deletedThis = false
+            if dry then
+                nukerLog(string.format("%s Would delete %s (%s)", tag, tostring(class or "?"), tostring(handle)))
+                deleted = deleted + 1
+                deletedThis = true
+            else
+                local okDel, via, attemptsTried = tryDeleteForSubject(subject, handle, class, -1)
+
+                if (not okDel) and (N.unequipBeforeDelete and handle) then
+                    local ownerWuid
+                    if ItemManager and ItemManager.GetItemOwner then
+                        local okO, w = pcall(ItemManager.GetItemOwner, handle)
+                        if okO and w then ownerWuid = w end
+                    end
+                    if not ownerWuid and subject then ownerWuid = getEntityWuid(subject) end
+
+                    if ownerWuid then
+                        local unOk, unVia = TryUnequip(subject, ownerWuid, handle)
+                        if unOk then
+                            okDel, via, attemptsTried = tryDeleteForSubject(subject, handle, class, -1)
+                            if okDel then
+                                nukerLog(string.format("[nuke] unequipped via %s → delete via %s",
+                                    tostring(unVia), tostring(via)))
+                            end
+                        end
+                    end
+                end
+
+                if okDel then
+                    deletedThis = true
+                    deleted = deleted + 1
+                    if handle then removedIds[#removedIds + 1] = uiIdFromHandle(handle) end
+                    nukerLog(string.format("%s deleted class=%s handle=%s via %s (lanesTried=%s)",
+                        tag, tostring(class), tostring(handle), tostring(via), tostring(attemptsTried)))
+                end
+            end
+
+            -- Always stash a UI id candidate for shadow delete
+            do
+                local uiid = uiIdFromRow(row)
+                if uiid then uiIds[#uiIds + 1] = uiid end
+            end
+
+            if not deletedThis then
+                kept = kept + 1
+                if not dry then
+                    nukerLog(string.format("%s delete failed for class=%s handle=%s", tag, tostring(class),
+                        tostring(handle)))
+                end
+            end
+        until true
+    end
+
+    -- immediate re-enum
+    local itemsAfter0, howAfter0 = enumSubject(subject)
+    local after0 = countKeys(itemsAfter0 or {})
+    nukerLog(("After0: %d items (via=%s)"):format(after0, tostring(howAfter0)))
+
+    local function finalize(reason)
+        UIRefresh.movie = (C.ui and C.ui.movie) or "ItemTransfer"
+        UIRefresh:Refresh()
+        nukerLog("UI refresh reason: " .. tostring(reason))
+        nukerLog(string.format("%s summary: deleted=%d kept=%d dry=%s (via=%s, subject=%s)",
+            tag, deleted, kept, tostring(dry), how,
+            tostring(subject.class or (subject.GetName and subject:GetName()) or "entity")))
+    end
+
+    if after0 == beforeCount and deleted > 0 then
+        later(50, function()
+            local itemsAfter1 = select(1, enumSubject(subject))
+            local after1 = countKeys(itemsAfter1 or {})
+            nukerLog(("After1(+50ms): %d items"):format(after1))
+
+            if after1 < beforeCount then
+                finalize("engine mutated after delay")
+                return
+            end
+
+            if after1 < beforeCount then
+                finalize("engine mutated after delay")
+                return
+            end
+
+            if (C.ui and C.ui.shadowDelete) and #uiIds > 0 then
+                for i = 1, #uiIds do ui_remove_row(uiIds[i]) end
+                finalize("shadow delete (engine read-only?)")
+            else
+                finalize("no engine change; just forced refresh")
+            end
+        end)
+        return true
+    end
+
+    if (after0 < beforeCount) or (deleted > 0) then
+        finalize("engine changed immediately or best-effort")
+    else
+        if (C.ui and C.ui.shadowDelete) and #uiIds > 0 then
+            for i = 1, #uiIds do ui_remove_row(uiIds[i]) end
+            finalize("shadow delete (engine refused)")
+        else
+            finalize("nothing changed; forced refresh anyway")
+        end
+    end
+
+    return true
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -697,15 +1006,22 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
             log(("Victim (corpse): %s d=%.2fm vWUID=%s"):format(tostring(corpse:GetName() or "<corpse>"), vdist or -1,
                 tostring(vWuid)))
 
-            -- A) direct tables on corpse entity
-            if tryEnumerateDirectOnEntity(corpse) then
-                if CorpseSanitizer.config.insanityMode and (CorpseSanitizer.config.nuker and CorpseSanitizer.config.nuker.enabled) then
-                    nukeNpcInventory(corpse)
-                else
-                    log(
-                        "[NUKE] skipped (insanityMode=false)")
+            -- A) direct enumeration on corpse
+            do
+                local itemsA, howA = tryEnumerateDirectOnEntity(corpse)
+                if itemsA then
+                    logItemsTable(itemsA, howA, 20, corpse)
+                    if CS.config.insanityMode and (CS.config.nuker and CS.config.nuker.enabled) then
+                        local okNuke2, errNuke2 = pcall(nukeNpcInventory, npc, {
+                            items  = items,
+                            victim = npc, -- owner match = NPC’s own WUID
+                        })
+                        if not okNuke2 then log("[nuke] error: " .. tostring(errNuke2)) end
+                    else
+                        log("[NUKE] skipped (insanityMode=false or nuker.disabled)")
+                    end
+                    return
                 end
-                return
             end
 
             -- B) if the corpse exposes a WUID, try it
@@ -715,7 +1031,10 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
                 local items, how = tryEnumerateByWuid(corpse, vwuid)
                 if items then
                     logItemsTable(items, how, 20, corpse)
-                    nukeNpcInventory(corpse, items)
+                    local okNuke, errNuke = pcall(nukeNpcInventory, corpse,
+                        { items = items, corpseCtx = true, victim = corpse })
+                    if not okNuke then log("[nuke] error: " .. tostring(errNuke)) end
+                    return
                 end
             end
         else
@@ -753,7 +1072,7 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
             log("OnOpened: no hooked WUID (hook may be missing in this build)")
         end
 
-        -- E) fallback: nearest NPC inventory (what succeeded in your last test)
+        -- E) fallback: nearest NPC-inventory
         do
             local list = scanNearbyOnce(4.0, 24)
             local npc, d2
@@ -764,19 +1083,34 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
                 end
             end
             if npc then
-                log(("Fallback NPC-inventory: %s (d=%.2fm)"):format(tostring((npc.GetName and npc:GetName()) or "<npc>"),
-                    math.sqrt(d2 or 0)))
+                log(("Fallback NPC-inventory: %s (d=%.2fm)"):format(
+                    tostring((npc.GetName and npc:GetName()) or "<npc>"), math.sqrt(d2 or 0)))
                 local items, how = enumNPCInventory(npc)
                 if items then
                     logItemsTable(items, how, 25, npc)
-                    if CorpseSanitizer.config.insanityMode and (CorpseSanitizer.config.nuker and CorpseSanitizer.config.nuker.enabled) then
-                        nukeNpcInventory(npc, items)
+                    -- UI-only purge for read-only corpse / boss container
+                    if CS.config.ui and CS.config.ui.shadowDelete and type(items) == "table" and #items > 0 then
+                        for i = 1, #items do
+                            local uiid = uiIdFromRow(items[i])
+                            if uiid then ui_remove_row(uiid) end
+                        end
+                        UIRefresh.movie = CS.config.ui.movie or "ItemTransfer"
+                        UIRefresh:Refresh()
+                        log("[CorpseSanitizer] UI shadow purged boss inventory (read-only corpse)")
+                        return -- skip nuker for this path; remove this 'return' if you still want to try nuker after purging
+                    end
+
+                    if CS.config.insanityMode and (CS.config.nuker and CS.config.nuker.enabled) then
+                        local okNuke2, errNuke2 = pcall(nukeNpcInventory, npc, {
+                            items  = items,
+                            victim = npc,
+                        })
+                        if not okNuke2 then log("[nuke] error: " .. tostring(errNuke2)) end
                     else
                         log("[NUKE] skipped (insanityMode=false or nuker.enabled=false)")
                     end
                 else
-                    log(
-                        "Fallback NPC-inventory: no enumerable items (" .. tostring(how) .. ")")
+                    log("Fallback NPC-inventory: no enumerable items (" .. tostring(how) .. ")")
                 end
             end
         end
@@ -842,7 +1176,7 @@ function CorpseSanitizer.EnableTransferLogging()
     if not (UIAction and UIAction.RegisterElementListener) then
         log("UIAction not available; cannot register ItemTransfer listeners"); return
     end
-    local movie = CorpseSanitizer.config.ui.movie
+    local movie = CS.config.ui.movie
     UIAction.RegisterElementListener(CorpseSanitizer, movie, -1, "OnOpened", "OnOpened")
     UIAction.RegisterElementListener(CorpseSanitizer, movie, -1, "OnClosed", "OnClosed")
     UIAction.RegisterElementListener(CorpseSanitizer, movie, -1, "OnFocusChanged", "OnFocusChanged")
@@ -853,11 +1187,58 @@ function CorpseSanitizer.Bootstrap()
     if CorpseSanitizer.booted then return end
     CorpseSanitizer.booted = true
     log("BOOT ok (version=" .. CorpseSanitizer.version .. ")")
+    log("Lua=" .. tostring(_VERSION or "unknown"))
     logEffectiveConfig()
 
-    installLootBeginHook()
-    installActorOpenHook()
-    log(CorpseSanitizer._loot._orig and "Loot hook: active" or "Loot hook: inactive")
-    log(CorpseSanitizer._loot._origActor and "Actor hook: active" or "Actor hook: inactive")
-    CorpseSanitizer.EnableTransferLogging()
+    -- Hooks
+    if XGenAIModule and type(XGenAIModule.LootInventoryBegin) == "function" and not CS._loot._orig then
+        CS._loot._orig = XGenAIModule.LootInventoryBegin
+        XGenAIModule.LootInventoryBegin = function(wuid, ...)
+            CS._loot.lastWUID = wuid
+            log("Loot hook: LootInventoryBegin wuid=" .. tostring(wuid))
+            return CS._loot._orig(wuid, ...)
+        end
+        log("Loot hook: installed on XGenAIModule.LootInventoryBegin")
+    else
+        log("Loot hook: XGenAIModule.LootInventoryBegin not available or already installed")
+    end
+
+    if XGenAIModule then
+        for k, v in pairs(XGenAIModule) do
+            if type(v) == "function" then
+                local name = tostring(k):lower()
+                if (name:find("inventory", 1, true) or name:find("transfer", 1, true))
+                    and (name:find("open", 1, true) or name:find("begin", 1, true) or name:find("start", 1, true)) then
+                    local orig = v
+                    XGenAIModule[k] = function(...)
+                        local a = { ... }
+                        local maybeWuid = a[1]
+                        if type(maybeWuid) == "userdata" then
+                            CS._loot.lastWUID = maybeWuid
+                            log("Loot hook (auto): XGenAIModule." .. k .. " wuid=" .. tostring(maybeWuid))
+                        end
+                        return orig(...)
+                    end
+                end
+            end
+        end
+    end
+
+
+    local p = getPlayer(); local act = p and p.actor
+    if act and type(act.OpenItemTransferStore) == "function" and not CS._loot._origActor then
+        CS._loot._origActor = act.OpenItemTransferStore
+        act.OpenItemTransferStore = function(self, ownerId, wuid, ...)
+            CS._loot.lastWUID    = wuid
+            CS._loot.lastOwnerId = ownerId
+            log(("Actor hook: OpenItemTransferStore owner=%s wuid=%s"):format(tostring(ownerId), tostring(wuid)))
+            return CS._loot._origActor(self, ownerId, wuid, ...)
+        end
+        log("Actor hook: installed on actor.OpenItemTransferStore")
+    else
+        log("Actor hook: OpenItemTransferStore not available or already installed")
+    end
+
+    UIRefresh.movie = (CS.config.ui and CS.config.ui.movie) or "ItemTransfer"
+    CS.EnableTransferLogging()
 end
