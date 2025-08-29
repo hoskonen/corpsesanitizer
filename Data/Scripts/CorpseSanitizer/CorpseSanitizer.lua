@@ -222,7 +222,6 @@ local function getPlayerPos()
     return nil
 end
 
--- Safe engine calls
 local function safeGetItemFromHandle(h)
     if not (ItemManager and ItemManager.GetItem) then return nil end
     local ok, it = pcall(ItemManager.GetItem, h); if ok and it then return it end
@@ -245,6 +244,47 @@ local function tryGetName(h)
         local ok, nm = pcall(ItemManager.GetItemName, h)
         if ok and nm and nm ~= "" then return tostring(nm) end
     end
+end
+
+-- Resolve a human-friendly item name
+local function getNiceName(it, row, handle, class)
+    -- 1) row fields first (cheapest)
+    local v = row and (row.displayName or row.DisplayName or row.Name or row.name)
+    if type(v) == "string" and v ~= "" then return v, "row.field" end
+
+    -- 2) item-table methods/fields
+    if type(it) == "table" then
+        local f = it.GetUIName or it.GetName
+        if type(f) == "function" then
+            local ok, nm = pcall(f, it)
+            if ok and nm and nm ~= "" then return tostring(nm), (it.GetUIName and "it:GetUIName()" or "it:GetName()") end
+        end
+        local flds = { it.displayName, it.DisplayName, it.sLocalizedName, it.sItemName, it.sName, it.Name, it.name }
+        for i = 1, #flds do
+            local s = flds[i]
+            if type(s) == "string" and s ~= "" then return s, "it.field" end
+        end
+    end
+
+    -- 3) manager by handle
+    if handle then
+        local ui = tryGetUIName(handle); if ui then return ui, "IM.UIName(handle)" end
+        local nm = tryGetName(handle); if nm then return nm, "IM.Name(handle)" end
+    end
+
+    -- 4) last chance: some builds accept class id on same APIs
+    if class and ItemManager then
+        local ok1, ui2 = pcall(ItemManager.GetItemUIName, class); if ok1 and ui2 and ui2 ~= "" then
+            return tostring(ui2),
+                "IM.UIName(class)"
+        end
+        local ok2, n2 = pcall(ItemManager.GetItemName, class); if ok2 and n2 and n2 ~= "" then
+            return tostring(n2),
+                "IM.Name(class)"
+        end
+    end
+
+    return class or "?", "fallback"
 end
 
 local function scanNearby(radius)
@@ -336,15 +376,18 @@ local function inv_iter0(t)
 end
 
 local function logRow(i0, row)
-    -- If the entry is a handle (userdata), resolve an item table from it
+    -- Resolve handle + item
     local handle, it
     if type(row) == "userdata" then
         handle = row
-        it = safeGetItemFromHandle(handle)
-        row = it or {} -- fall back to empty table
+        if ItemManager and ItemManager.GetItem then
+            local ok, itm = pcall(ItemManager.GetItem, handle)
+            if ok and itm then it = itm end
+        end
+        row = it or {} -- continue with a table either way
     elseif type(row) == "table" then
-        handle = row.handle or row.Handle or row.id or row.Id
         it = row
+        handle = row.handle or row.Handle or row.id or row.Id
     else
         System.LogAlways(string.format(
             "[CorpseSanitizer]   [%s] (unsupported row type) type=%s repr=%s",
@@ -352,36 +395,37 @@ local function logRow(i0, row)
         return
     end
 
-    -- Strings only; coerce everything
+    -- Class/amount/hp (coerced safely)
     local class = tostring(it.class or it.Class or row.class or row.Class or "?")
-
-    -- Prefer human name (UI label → base name → class)
-    local name = row.name or row.Name or row.displayName or row.DisplayName
-    if (not name or name == "" or name == class) and handle then
-        name = tryGetUIName(handle) or tryGetName(handle) or class
-    end
-    if not name or name == "" then name = class end
-
-    -- Amount & HP (coerce, never trust type)
-    local amt = tonumber(it.amount or it.Amount or row.amount or row.Amount or row.count or row.Count or 1) or 1
-    local hp  = tonumber(it.health or it.Health or row.health or row.Health or it.hp or it.HP or row.hp or row.HP or 1.0) or
-        1.0
+    local amt   = tonumber(it.amount or it.Amount or row.amount or row.Amount or row.count or row.Count or 1) or 1
+    local hp    = tonumber(it.health or it.Health or row.health or row.Health or it.hp or it.HP or row.hp or row.HP or
+    1.0) or 1.0
     if hp > 1.001 and hp <= 100 then hp = hp / 100 end
 
-    -- Owner (safe)
-    local owner = handle and safeGetOwnerFromHandle(handle)
-    local ownerStr = owner and (" owner=" .. tostring(owner)) or ""
+    -- Friendly name
+    local name, nameVia = getNiceName(it, row, handle, class)
 
-    -- Use %s everywhere so weird types can’t crash formatting
+    -- Owner (optional)
+    local owner = nil
+    if handle and ItemManager and ItemManager.GetItemOwner then
+        local ok, w = pcall(ItemManager.GetItemOwner, handle)
+        if ok and w then owner = w end
+    end
+
     System.LogAlways(string.format(
-        "[CorpseSanitizer]   [%s] class=%s name=%s hp=%s amt=%s handle=%s%s",
-        tostring(i0), tostring(class), tostring(name), tostring(hp),
-        tostring(amt), tostring(handle), ownerStr))
+        "[CorpseSanitizer]   [%s] class=%s name=%s hp=%s amt=%s handle=%s%s (via=%s)",
+        tostring(i0),
+        tostring(class),
+        tostring(name),
+        string.format("%.2f", hp),
+        tostring(amt),
+        tostring(handle),
+        owner and (" owner=" .. tostring(owner)) or "",
+        tostring(nameVia)))
 end
 
 
-
--- Dump rows robustly; count by iterating (don’t trust #t), guard logRow with pcall
+-- Dump rows robustly; count by iterating (don't trust #t), guard logRow with pcall
 local function logInventoryRows(items, how, maxRows)
     maxRows = maxRows or 100
     System.LogAlways("[CorpseSanitizer] Enumerator used: " .. tostring(how))
