@@ -222,29 +222,20 @@ local function getPlayerPos()
     return nil
 end
 
-local function safeGetItemFromHandle(h)
-    if not (ItemManager and ItemManager.GetItem) then return nil end
-    local ok, it = pcall(ItemManager.GetItem, h); if ok and it then return it end
-end
-
-local function safeGetOwnerFromHandle(h)
-    if not (ItemManager and ItemManager.GetItemOwner) then return nil end
-    local ok, w = pcall(ItemManager.GetItemOwner, h); if ok and w then return w end
-end
-
-local function tryGetUIName(h)
-    if ItemManager and ItemManager.GetItemUIName and h then
-        local ok, nm = pcall(ItemManager.GetItemUIName, h)
-        if ok and nm and nm ~= "" then return tostring(nm) end
-    end
-end
-
 local function tryGetName(h)
     if ItemManager and ItemManager.GetItemName and h then
         local ok, nm = pcall(ItemManager.GetItemName, h)
         if ok and nm and nm ~= "" then return tostring(nm) end
     end
 end
+
+local function getNameByClassId(classId)
+    if not (ItemManager and ItemManager.GetItemName) then return nil end
+    if not classId or classId == "" then return nil end
+    local ok, nm = pcall(ItemManager.GetItemName, classId)
+    if ok and nm and nm ~= "" then return tostring(nm) end
+end
+
 
 local function scanNearby(radius)
     radius = radius or (CS.config.proximity and CS.config.proximity.radius) or 6.0
@@ -361,18 +352,20 @@ local function logRow(i0, row)
         1.0) or 1.0
     if hp > 1.001 and hp <= 100 then hp = hp / 100 end
 
-    local name = class -- default
+    -- NAME: by CLASS id, then item method fallback
+    local name = getNameByClassId(class)
 
-    -- preferred: engine name from handle
-    if handle then
-        local nm = tryGetName(handle)
-        if nm and nm ~= "" then name = nm end
-    end
-
-    -- fallback: item table method if available
-    if name == class and type(it) == "table" and type(it.GetName) == "function" then
+    if (not name or name == "") and type(it) == "table" and type(it.GetName) == "function" then
         local ok, nm = pcall(it.GetName, it)
         if ok and nm and nm ~= "" then name = tostring(nm) end
+    end
+
+    if not name or name == "" then name = class end
+
+    local owner
+    if handle and ItemManager and ItemManager.GetItemOwner then
+        local ok, w = pcall(ItemManager.GetItemOwner, handle)
+        if ok and w then owner = w end
     end
 
     -- then your final print (keep the rest of your fields as-is)
