@@ -12,6 +12,14 @@ CorpseSanitizer = CorpseSanitizer or {
 }
 local CS = CorpseSanitizer
 
+-- Forward declares so locals are captured as upvalues inside functions defined earlier
+local enumNPCInventory
+local hideNameFromTransfer
+local hideClassFromTransfer
+local resolvePaneIdx
+local resolveRow
+local toUiRow
+
 local function log(msg) System.LogAlways("[CorpseSanitizer] " .. tostring(msg)) end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -30,35 +38,16 @@ local function setarray(movie, inst, key, tbl)
     return ok and true or false
 end
 
--- Normalize one engine row into a SWF-friendly row (include aliases)
-local function toUiRow(row)
-    local id     = tostring((row.id or row.Id or row.stackId or row.StackId or row.handle or row.Handle) or
-        ("cs_" .. tostring(os.time())))
-    local name   = tostring(row.name or row.Name or row.displayName or row.DisplayName or row.class or "Unknown")
-    local class  = tostring(row.class or row.Class or "unknown")
-    local amount = tonumber(row.amt or row.Amt or row.amount or row.Amount or row.count or row.Count or 1) or 1
-    local hp     = row.hp or row.HP or row.health or row.Health or 1.0
-    if type(hp) == "number" and hp > 1.001 then hp = hp / 100 end
-    local icon = tostring(row.icon or row.Icon or "")
-    return {
-        id = id,
-        Id = id,
-        name = name,
-        Name = name,
-        class = class,
-        Class = class,
-        amount = amount,
-        Amount = amount,
-        count = amount,
-        Count = amount,
-        hp = hp,
-        HP = hp,
-        health = hp,
-        Health = hp,
-        icon = icon,
-        Icon = icon,
-    }
+-- Simple "later" helper: use engine timer if available, else run immediately
+local function later(ms, fn)
+    if Script and Script.SetTimer then
+        Script.SetTimer(ms, fn)
+    else
+        local ok, err = pcall(fn)
+        if not ok then System.LogAlways("[CorpseSanitizer] later() fallback error: " .. tostring(err)) end
+    end
 end
+
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- ItemTransfer UI Controller (bound to exposed fc_* API)
@@ -132,6 +121,175 @@ function UIXfer:AddFor(idx, row)
     setarray(self.movie or "ItemTransfer", self.inst or 0, "Items", { toUiRow(row) })
     uicall(self.movie or "ItemTransfer", self.inst or 0, "fc_addItem", idx)
     return true
+end
+
+-- handle/userdata or table row -> handle,it,classId,name,amount,hp
+-- 1) Resolve engine row (userdata/table) into usable fields
+local function resolveRow(row)
+    local handle, it, classId, name, amount, hp
+
+    if type(row) == "userdata" then
+        handle = row
+        if ItemManager and ItemManager.GetItem then
+            local ok, itm = pcall(ItemManager.GetItem, handle)
+            if ok and itm then it = itm end
+        end
+    elseif type(row) == "table" then
+        it     = row
+        handle = row.handle or row.Handle or row.Id or row.id
+    end
+
+    if it then classId = it.class or it.Class end
+    if not classId and type(row) == "table" then classId = row.class or row.Class end
+    classId = classId and tostring(classId) or "unknown"
+
+    if ItemManager and ItemManager.GetItemName then
+        local ok, nm = pcall(ItemManager.GetItemName, classId) -- KCD: expects classId
+        if ok and nm and nm ~= "" then name = tostring(nm) end
+    end
+    if not name and type(it) == "table" and type(it.GetName) == "function" then
+        local ok, nm = pcall(it.GetName, it); if ok and nm and nm ~= "" then name = tostring(nm) end
+    end
+    if not name then name = classId end
+
+    amount = tonumber((it and (it.amount or it.Amount or it.count or it.Count)) or 1) or 1
+
+    hp = tonumber((it and (it.health or it.Health or it.hp or it.HP)) or 1.0) or 1.0
+    if hp > 1.001 and hp <= 100 then hp = hp / 100 end
+
+    return handle, it, classId, name, amount, hp
+end
+
+-- 2) Build a row object the SWF can consume
+local function toUiRow(row)
+    local handle, it, classId, name, amount, hp = resolveRow(row)
+
+    -- Prefer handle as unique Id (string). SWF RemoveItem typically uses "Id".
+    local id = handle and tostring(handle)
+    if not id then
+        id = string.format("cs_%s_%s_%s_%d", classId, tostring(amount), tostring(hp), os.time())
+    end
+
+    -- Provide both lower- and UpperCamel keys—some SWFs expect one or the other.
+    local ui = {
+        id = id,
+        Id = id,
+        name = name,
+        Name = name,
+        class = classId,
+        Class = classId,
+        amount = amount,
+        Amount = amount,
+        hp = hp,
+        Hp = hp,
+        icon = "",
+        Icon = "",
+    }
+    return ui
+end
+
+-- Push a list into ItemTransfer (paneIdx: 0=left, 1=right)
+local function pushItemsToPane(paneIdx, rows, inst)
+    local idx    = tonumber(paneIdx) or 0
+    local instId = (inst ~= nil) and inst or ((UIXfer and UIXfer.inst) or 0)
+
+    if not (UIAction and UIAction.SetArray and UIAction.CallFunction) then
+        System.LogAlways("[CorpseSanitizer/UI] UIAction missing; cannot push items")
+        return false
+    end
+
+    -- build lists
+    local items, info, built = {}, {}, 0
+    for i = 1, #rows do
+        local ok, uirow = pcall(toUiRow, rows[i])
+        if ok and uirow then
+            items[#items + 1] = uirow
+            info[#info + 1]   = { Id = uirow.Id, Hp = uirow.Hp, Amount = uirow.Amount }
+            built             = built + 1
+        else
+            System.LogAlways("[CorpseSanitizer/UI] toUiRow fail at " .. tostring(i - 1))
+        end
+    end
+    System.LogAlways(string.format("[CorpseSanitizer/UI] built %d/%d ui rows", built, #rows))
+
+    -- clear first
+    local okClr = pcall(UIAction.CallFunction, "ItemTransfer", instId, "fc_clearItems", idx)
+    System.LogAlways("[CorpseSanitizer/UI] fc_clearItems -> " .. tostring(okClr))
+
+    -- write arrays (try both 'name' and 'varname' from XML)
+    local okA   = pcall(UIAction.SetArray, "ItemTransfer", instId, "Items", items)
+    local okAi  = pcall(UIAction.SetArray, "ItemTransfer", instId, "ItemInfo", info)
+    local okG   = pcall(UIAction.SetArray, "ItemTransfer", instId, "g_ItemsA", items)
+    local okGi  = pcall(UIAction.SetArray, "ItemTransfer", instId, "g_ItemInfoA", info)
+
+    -- commit
+    local okSet = pcall(UIAction.CallFunction, "ItemTransfer", instId, "fc_setItems", idx)
+
+    System.LogAlways(string.format(
+        "[CorpseSanitizer/UI] push pane=%s inst=%s list=%d SA=%s SAinfo=%s SAg=%s SAginfo=%s set=%s",
+        tostring(idx), tostring(instId), #items, tostring(okA), tostring(okAi), tostring(okG), tostring(okGi),
+        tostring(okSet)
+    ))
+    return okSet
+end
+
+-- Hide one class id (faster / unambiguous)
+function hideClassFromTransfer(npc, paneIdx, classId)
+    local items, how = enumNPCInventory(npc)
+    if type(items) ~= "table" then
+        System.LogAlways("[CorpseSanitizer/UI] hideClassFromTransfer: no items (" .. tostring(how) .. ")")
+        return
+    end
+    local kept = {}
+    for i = 1, #items do
+        local it = items[i]
+        local cls = (type(it) == "table" and (it.class or it.Class)) or tostring(it)
+        if tostring(cls) ~= tostring(classId) then
+            kept[#kept + 1] = it
+        end
+    end
+    pushItemsToPane(paneIdx or 0, kept)
+end
+
+-- Hide by engine *name* (e.g., "appleDried"), case-insensitively
+-- forward declare if enumNPCInventory is defined later:
+-- local enumNPCInventory
+
+function hideNameFromTransfer(npc, paneIdx, targetName)
+    System.LogAlways("[CorpseSanitizer/UI] hideNameFromTransfer enter pane=" ..
+        tostring(paneIdx) .. " target=" .. tostring(targetName))
+    if not npc then
+        System.LogAlways("[CorpseSanitizer/UI] hideNameFromTransfer: npc=nil")
+        return
+    end
+
+    local items, how = enumNPCInventory(npc)
+    System.LogAlways("[CorpseSanitizer/UI] enum -> items=" ..
+        tostring(items) .. " type=" .. tostring(type(items)) .. " how=" .. tostring(how))
+    if type(items) ~= "table" then
+        System.LogAlways("[CorpseSanitizer/UI] hideNameFromTransfer: no items (" .. tostring(how) .. ")")
+        return
+    end
+
+    local want = string.lower(tostring(targetName or ""))
+
+    local kept, removed = {}, 0
+    for i = 1, #items do
+        local row = items[i]
+        local handle, it, classId, engName = resolveRow(row)
+        local nm = engName or classId or "?"
+
+        local keep = (string.lower(nm) ~= want)
+        System.LogAlways(string.format(
+            "[CorpseSanitizer/UI] row[%d] cls=%s name=%s keep=%s (handle=%s it=%s)",
+            i - 1, tostring(classId), tostring(nm), tostring(keep), tostring(handle), tostring(it)))
+
+        if keep then kept[#kept + 1] = row else removed = removed + 1 end
+    end
+
+    System.LogAlways(string.format("[CorpseSanitizer/UI] filter result: kept=%d removed=%d", #kept, removed))
+    local ok = pushItemsToPane(paneIdx, kept)
+    System.LogAlways("[CorpseSanitizer/UI] push result=" .. tostring(ok))
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -222,20 +380,12 @@ local function getPlayerPos()
     return nil
 end
 
-local function tryGetName(h)
-    if ItemManager and ItemManager.GetItemName and h then
-        local ok, nm = pcall(ItemManager.GetItemName, h)
-        if ok and nm and nm ~= "" then return tostring(nm) end
-    end
-end
-
 local function getNameByClassId(classId)
     if not (ItemManager and ItemManager.GetItemName) then return nil end
     if not classId or classId == "" then return nil end
     local ok, nm = pcall(ItemManager.GetItemName, classId)
     if ok and nm and nm ~= "" then return tostring(nm) end
 end
-
 
 local function scanNearby(radius)
     radius = radius or (CS.config.proximity and CS.config.proximity.radius) or 6.0
@@ -272,7 +422,7 @@ local function findNearestHumanoid(radius)
 end
 
 -- Enumerate NPC inventory robustly (0-based, 1-based, or sparse), no mutations
-local function enumNPCInventory(npc)
+function enumNPCInventory(npc)
     local inv = npc and npc.inventory
     if inv and type(inv.GetInventoryTable) == "function" then
         local ok, t = pcall(inv.GetInventoryTable, inv)
@@ -401,10 +551,135 @@ local function logInventoryRows(items, how, maxRows)
     end
 end
 
+-- Remove all rows whose engine name matches `targetName` by trying id=(i) and id=(i-1) and handle-string
+local function guessRemoveByName(npc, paneIdx, targetName)
+    local items, how = enumNPCInventory(npc)
+    if type(items) ~= "table" then
+        System.LogAlways("[CorpseSanitizer/UI] guessRemoveByName: no items (" .. tostring(how) .. ")")
+        return 0
+    end
+    local pane = tonumber(paneIdx) or 0
+    local removed = 0
+    for i = 1, #items do
+        local row = items[i]
+        local handle, it, classId, name = resolveRow(row) -- your resolver: handle->item->classId->nice name
+        local nm = string.lower(tostring(name or classId or "?"))
+        if nm == string.lower(tostring(targetName or "")) then
+            local id1 = tostring(i)     -- 1-based guess
+            local id0 = tostring(i - 1) -- 0-based fallback
+            local idH = handle and tostring(handle) or nil
+
+            local ok1 = pcall(UIAction.CallFunction, "ItemTransfer", UIXfer.inst or 0, "fc_removeItem", id1, pane)
+            local ok0 = pcall(UIAction.CallFunction, "ItemTransfer", UIXfer.inst or 0, "fc_removeItem", id0, pane)
+            local okH = idH and
+                pcall(UIAction.CallFunction, "ItemTransfer", UIXfer.inst or 0, "fc_removeItem", idH, pane) or false
+
+            System.LogAlways(string.format(
+                "[CorpseSanitizer/UI] remove try idx=%d nm=%s ids={%s,%s,%s} -> {%s,%s,%s}",
+                i - 1, tostring(name), id1, id0, tostring(idH), tostring(ok1), tostring(ok0), tostring(okH)
+            ))
+            if ok1 or ok0 or okH then removed = removed + 1 end
+        end
+    end
+    System.LogAlways("[CorpseSanitizer/UI] guessRemoveByName removed=" .. tostring(removed))
+    return removed
+end
+
+-- Remove all rows whose engine name or classId equals target (case-insensitive)
+-- Remove all rows whose engine name or classId equals target (case-insensitive),
+-- trying multiple Id forms so SWF Remove() matches one.
+local function pruneByName(npc, paneIdx, target)
+    local items, how = enumNPCInventory(npc)
+    if type(items) ~= "table" then
+        System.LogAlways("[CorpseSanitizer/UI] pruneByName: no items (" .. tostring(how) .. ")")
+        return 0
+    end
+    local want = string.lower(tostring(target or ""))
+    local pane = tonumber(paneIdx) or 0
+    local removed = 0
+
+    for i = 1, #items do
+        local row = items[i]
+        local handle, it, classId, name = resolveRow(row)
+        local nm = string.lower(tostring(name or classId or "?"))
+        if nm == want then
+            local id1 = tostring(i)     -- 1-based guess (common)
+            local id0 = tostring(i - 1) -- 0-based fallback
+            local idH = handle and tostring(handle) or nil
+
+            local ok1 = pcall(UIAction.CallFunction, "ItemTransfer", UIXfer.inst or 0, "fc_removeItem", id1, pane)
+            local ok0 = pcall(UIAction.CallFunction, "ItemTransfer", UIXfer.inst or 0, "fc_removeItem", id0, pane)
+            local okH = idH and
+                pcall(UIAction.CallFunction, "ItemTransfer", UIXfer.inst or 0, "fc_removeItem", idH, pane) or false
+
+            System.LogAlways(string.format(
+                "[CorpseSanitizer/UI] remove idx=%d name=%s ids={%s,%s,%s} -> {%s,%s,%s}",
+                i - 1, tostring(name), id1, id0, tostring(idH), tostring(ok1), tostring(ok0), tostring(okH)
+            ))
+            if ok1 or ok0 or okH then removed = removed + 1 end
+        end
+    end
+
+    System.LogAlways("[CorpseSanitizer/UI] pruneByName removed=" .. tostring(removed))
+    return removed
+end
+
+local function rebuildPaneWithout(npc, paneIdx, bannedName)
+    local items, how = enumNPCInventory(npc)
+    if type(items) ~= "table" then return false end
+    local want = string.lower(bannedName or "")
+    local arr = {}
+    -- Count placeholder; we’ll fix it after we push rows
+    arr[1] = 0
+    local count = 0
+
+    for i = 1, #items do
+        local handle, it, classId, name, amount, hp = resolveRow(items[i])
+        local nm = string.lower(tostring(name or classId or "?"))
+        if nm ~= want then
+            -- each row: push Id, then the InventoryItem.Set() fields
+            local id = tostring(i)                       -- any unique string is fine
+            arr[#arr + 1] = id
+            arr[#arr + 1] = name or classId or "Unknown" -- Name
+            arr[#arr + 1] = classId or "unknown"         -- ClassId
+            arr[#arr + 1] = 0                            -- Category (0 = SWF maps via GetCategoryId)
+            arr[#arr + 1] = "Common"                     -- IconId
+            arr[#arr + 1] = tonumber(amount or 1) or 1   -- Amount
+            arr[#arr + 1] = 0                            -- MainStat
+            arr[#arr + 1] = tonumber(hp or 1.0) or 1.0   -- Health (0..1)
+            arr[#arr + 1] = 0                            -- Quality
+            arr[#arr + 1] = 0                            -- HealthState
+            arr[#arr + 1] = 0.0                          -- Weight
+            arr[#arr + 1] = 0                            -- Price
+            arr[#arr + 1] = true                         -- IsEnable
+            arr[#arr + 1] = false                        -- OutfitPresence
+            arr[#arr + 1] = false                        -- IsQuestItem
+            arr[#arr + 1] = false                        -- IsNew
+            arr[#arr + 1] = 0                            -- Stolen
+            arr[#arr + 1] = 0.0                          -- Dirt
+            arr[#arr + 1] = 0                            -- Blood
+            arr[#arr + 1] = 0                            -- BuffIcon
+            arr[#arr + 1] = 0                            -- BuffDefId
+            arr[#arr + 1] = false                        -- IsRepainted
+            count = count + 1
+        end
+    end
+
+    arr[1] = count -- fix the count at the start
+    local pane = tonumber(paneIdx) or 0
+    local inst = UIXfer and (UIXfer.inst or 0) or 0
+    local okA = pcall(UIAction.SetArray, "ItemTransfer", inst, "g_ItemsA", arr)
+    local okS = pcall(UIAction.CallFunction, "ItemTransfer", inst, "fc_setItems", pane)
+    System.LogAlways(string.format("[CorpseSanitizer/UI] fc_setItems filtered pane=%s count=%d -> setArray=%s set=%s",
+        tostring(pane), count, tostring(okA), tostring(okS)))
+    return okA and okS
+end
+
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- UI listeners
 -- ─────────────────────────────────────────────────────────────────────────────
-local function resolvePaneIdx()
+function resolvePaneIdx()
     local p = CS and CS.config and CS.config.ui and CS.config.ui.pane
     if p == "left" then return 0 end
     if p == "right" then return 1 end
@@ -414,47 +689,51 @@ local function resolvePaneIdx()
 end
 
 function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
-    log("OnOpened → transfer UI visible (element=" ..
-        tostring(elementName) .. ", instance=" .. tostring(instanceId) .. ")")
+    UIXfer.movie = (CS.config.ui and CS.config.ui.movie) or "ItemTransfer"
+    if instanceId ~= nil then UIXfer.inst = instanceId end
+    log("OnOpened → transfer UI visible (element=" .. tostring(elementName) .. ", instance=" .. tostring(instanceId) ..
+        ")")
 
     local radius = (CS.config.proximity and CS.config.proximity.radius) or 6.0
     local npc, d2 = findNearestHumanoid(radius)
-    if npc then
-        local npcName = "<npc>"
-        if npc.GetName then pcall(function() npcName = npc:GetName() end) end
-        local dist = d2 and math.sqrt(d2) or 0
-        log(string.format("Nearby target: %s (d=%.2fm)", tostring(npcName), dist))
-
-        local items, how = enumNPCInventory(npc)
-        if items and type(items) == "table" then
-            if not CS.config.logging or CS.config.logging.dumpRows ~= false then
-                logInventoryRows(items, how, 100)
-            end
-
-            local ui = CS.config.ui
-            if ui and ui.echoToUI then
-                UIXfer.movie = ui.movie or "ItemTransfer"
-                local pane = resolvePaneIdx()
-                local ok = UIXfer:SetItemsFor(pane, items)
-                if not ok then
-                    System.LogAlways("[CorpseSanitizer/UI] echo failed; trying both panes")
-                    UIXfer:SetItemsFor(0, items)
-                    UIXfer:SetItemsFor(1, items)
-                end
-            end
-        else
-            log("No enumerable items for nearby target (" .. tostring(how) .. ")")
-            if CS.config.logging and CS.config.logging.probeOnMiss then
-                log("Hint: read-only bodies / quest containers may block this lane.")
-            end
-            local ui = CS.config.ui
-            if ui and ui.echoToUI then
-                local pane = resolvePaneIdx()
-                UIXfer:ClearFor(pane)
-            end
-        end
-    else
+    if not npc then
         log("No humanoid within " .. tostring(radius) .. " m")
+        return
+    end
+
+    local npcName = "<npc>"
+    if npc.GetName then pcall(function() npcName = npc:GetName() end) end
+    local dist = d2 and math.sqrt(d2) or 0
+    log(string.format("Nearby target: %s (d=%.2fm)", tostring(npcName), dist))
+
+    local items, how = enumNPCInventory(npc)
+    if items and type(items) == "table" then
+        if not CS.config.logging or CS.config.logging.dumpRows ~= false then
+            logInventoryRows(items, how, 100)
+        end
+
+        -- Let the SWF finish its initial bind, then sanitize both panes
+        later(150, function()
+            local inst = UIXfer and (UIXfer.inst or 0) or 0
+
+            for pane = 0, 1 do
+                pcall(UIAction.CallFunction, "ItemTransfer", inst, "fc_clearItems", pane)
+                local ok = pcall(rebuildPaneWithout, npc, pane, "appleDried")
+                System.LogAlways(string.format("[CorpseSanitizer/UI] rebuildPaneWithout pane=%d -> %s", pane,
+                    tostring(ok)))
+            end
+
+            -- Gentle repaint nudge
+            pcall(UIAction.CallFunction, "ItemTransfer", inst, "fc_sortNext")
+            pcall(UIAction.CallFunction, "ItemTransfer", inst, "fc_sortPrev")
+        end)
+
+        -- OPTIONAL: re-apply when user flips views/tabs/sorts
+        -- if UIAction and UIAction.RegisterElementListener then
+        --     UIAction.RegisterElementListener(self, UIXfer.movie, UIXfer.inst, "OnViewChanged", "OnViewChanged")
+        -- end
+    else
+        log("No enumerable items for nearby target (" .. tostring(how) .. ")")
     end
 end
 
@@ -472,6 +751,33 @@ function CorpseSanitizer:OnViewChanged(elementName, instanceId, eventName, args)
     local n = tonumber(cid) or 0
     UIXfer.activeIdx = n
     System.LogAlways(string.format("[CorpseSanitizer] OnViewChanged → active pane=%d", n))
+end
+
+-- Store last focused/clicked id per pane
+CS.ui.last = CS.ui.last or { id = nil, pane = 0 }
+
+function CorpseSanitizer:OnFocusChanged(element, inst, event, args)
+    -- args.Ids is a string, could contain multiple ids separated by space
+    local ids    = args and args.Ids or args and args[1]
+    local client = args and (args.ClientId or args[4]) or 0
+    if ids and ids ~= "" then
+        CS.ui.last.id   = ids
+        CS.ui.last.pane = tonumber(client) or 0
+        System.LogAlways(string.format("[CorpseSanitizer/UI] focus ids=%s pane=%s", tostring(ids), tostring(client)))
+    end
+end
+
+function CorpseSanitizer:OnDoubleClicked(element, inst, event, args)
+    local ids    = args and args.Ids or args and args[1]
+    local client = args and (args.ClientId or args[2]) or 0
+    System.LogAlways(string.format("[CorpseSanitizer/UI] doubleclick ids=%s pane=%s", tostring(ids), tostring(client)))
+    -- dev probe: try to remove the clicked row by its SWF Id
+    if UIAction and UIAction.CallFunction and ids and ids ~= "" then
+        local ok = pcall(UIAction.CallFunction, "ItemTransfer", UIXfer.inst or 0, "fc_removeItem", tostring(ids),
+            tonumber(client) or 0)
+        System.LogAlways("[CorpseSanitizer/UI] fc_removeItem(" ..
+            tostring(ids) .. "," .. tostring(client) .. ") -> " .. tostring(ok))
+    end
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -493,6 +799,8 @@ function CorpseSanitizer.Bootstrap()
         UIAction.RegisterElementListener(CorpseSanitizer, UIXfer.movie, -1, "OnOpened", "OnOpened")
         UIAction.RegisterElementListener(CorpseSanitizer, UIXfer.movie, -1, "OnClosed", "OnClosed")
         UIAction.RegisterElementListener(CorpseSanitizer, UIXfer.movie, -1, "OnViewChanged", "OnViewChanged")
+        UIAction.RegisterElementListener(CorpseSanitizer, UIXfer.movie, UIXfer.inst, "OnFocusChanged", "OnFocusChanged")
+        UIAction.RegisterElementListener(CorpseSanitizer, UIXfer.movie, UIXfer.inst, "OnDoubleClicked", "OnDoubleClicked")
         log("Registered UI listeners for " .. tostring(UIXfer.movie))
     else
         log("UIAction missing; cannot register UI listeners")

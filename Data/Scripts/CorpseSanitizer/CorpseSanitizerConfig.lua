@@ -4,9 +4,10 @@ return {
     insanityMode = true, -- keep the normal open → detect → enumerate flow alive
 
     ui           = {
-        movie        = "ItemTransfer",
-        shadowDelete = true, -- ← do NOT hide/change rows in .gfx yet
+        movie          = "ItemTransfer",
+        shadowDelete   = true, -- ← do NOT hide/change rows in .gfx yet
         -- uiOnly    = false,  -- (if this key exists in your build) keep false for now
+        debugHideApple = true
     },
 
     nuker        = {
