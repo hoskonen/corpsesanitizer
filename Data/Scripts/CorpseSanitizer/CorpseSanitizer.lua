@@ -210,7 +210,7 @@ end
 -- Targeting + enumeration (no engine mutations)
 -- ─────────────────────────────────────────────────────────────────────────────
 local function getPlayer()
-    return _G.g_localActor or (_G.System and _G.System.GetLocalPlayer and System.GetLocalPlayer())
+    return System.GetEntityByName("Henry") or System.GetEntityByName("dude")
 end
 
 local function getPlayerPos()
@@ -220,6 +220,31 @@ local function getPlayerPos()
         if ok and p then return p end
     end
     return nil
+end
+
+-- Safe engine calls
+local function safeGetItemFromHandle(h)
+    if not (ItemManager and ItemManager.GetItem) then return nil end
+    local ok, it = pcall(ItemManager.GetItem, h); if ok and it then return it end
+end
+
+local function safeGetOwnerFromHandle(h)
+    if not (ItemManager and ItemManager.GetItemOwner) then return nil end
+    local ok, w = pcall(ItemManager.GetItemOwner, h); if ok and w then return w end
+end
+
+local function tryGetUIName(h)
+    if ItemManager and ItemManager.GetItemUIName and h then
+        local ok, nm = pcall(ItemManager.GetItemUIName, h)
+        if ok and nm and nm ~= "" then return tostring(nm) end
+    end
+end
+
+local function tryGetName(h)
+    if ItemManager and ItemManager.GetItemName and h then
+        local ok, nm = pcall(ItemManager.GetItemName, h)
+        if ok and nm and nm ~= "" then return tostring(nm) end
+    end
 end
 
 local function scanNearby(radius)
@@ -310,32 +335,50 @@ local function inv_iter0(t)
     end
 end
 
--- pretty-print one row (safe)
 local function logRow(i0, row)
-    -- Safe coercers
-    local function num(x, d)
-        local n = tonumber(x); if n == nil then return d end; return n
+    -- If the entry is a handle (userdata), resolve an item table from it
+    local handle, it
+    if type(row) == "userdata" then
+        handle = row
+        it = safeGetItemFromHandle(handle)
+        row = it or {} -- fall back to empty table
+    elseif type(row) == "table" then
+        handle = row.handle or row.Handle or row.id or row.Id
+        it = row
+    else
+        System.LogAlways(string.format(
+            "[CorpseSanitizer]   [%s] (unsupported row type) type=%s repr=%s",
+            tostring(i0), tostring(type(row)), tostring(row)))
+        return
     end
-    local function str(x) if x == nil then return "nil" else return tostring(x) end end
 
-    local class = str(row and (row.class or row.Class) or "?")
-    local name  = str(row and (row.name or row.displayName or class) or "?")
-    local amt   = num(row and (row.amt or row.amount or row.count), 1)
-    local hp    = num(row and (row.hp or row.health or row.Health), 1.0)
-    -- Normalize hp if it looks like 0–100 instead of 0–1
+    -- Strings only; coerce everything
+    local class = tostring(it.class or it.Class or row.class or row.Class or "?")
+
+    -- Prefer human name (UI label → base name → class)
+    local name = row.name or row.Name or row.displayName or row.DisplayName
+    if (not name or name == "" or name == class) and handle then
+        name = tryGetUIName(handle) or tryGetName(handle) or class
+    end
+    if not name or name == "" then name = class end
+
+    -- Amount & HP (coerce, never trust type)
+    local amt = tonumber(it.amount or it.Amount or row.amount or row.Amount or row.count or row.Count or 1) or 1
+    local hp  = tonumber(it.health or it.Health or row.health or row.Health or it.hp or it.HP or row.hp or row.HP or 1.0) or
+        1.0
     if hp > 1.001 and hp <= 100 then hp = hp / 100 end
-    local handle = row and (row.handle or row.Handle or row.Id or row.id)
 
-    local ownerStr = ""
-    if ItemManager and ItemManager.GetItemOwner and handle then
-        local ok, own = pcall(ItemManager.GetItemOwner, handle)
-        if ok and own then ownerStr = " owner=" .. tostring(own) end
-    end
+    -- Owner (safe)
+    local owner = handle and safeGetOwnerFromHandle(handle)
+    local ownerStr = owner and (" owner=" .. tostring(owner)) or ""
 
+    -- Use %s everywhere so weird types can’t crash formatting
     System.LogAlways(string.format(
-        "[CorpseSanitizer]   [%d] class=%s name=%s hp=%.2f amt=%s handle=%s%s",
-        i0, class, name, hp, tostring(amt), tostring(handle), ownerStr))
+        "[CorpseSanitizer]   [%s] class=%s name=%s hp=%s amt=%s handle=%s%s",
+        tostring(i0), tostring(class), tostring(name), tostring(hp),
+        tostring(amt), tostring(handle), ownerStr))
 end
+
 
 
 -- Dump rows robustly; count by iterating (don’t trust #t), guard logRow with pcall
@@ -349,15 +392,9 @@ local function logInventoryRows(items, how, maxRows)
             local ok, err = pcall(logRow, i0, row)
             if not ok then
                 System.LogAlways("[CorpseSanitizer] logRow error: " .. tostring(err))
-                -- Fallback: print raw fields without numeric formatting
-                local cls = tostring(row and (row.class or row.Class) or "?")
-                local nm  = tostring(row and (row.name or row.displayName or cls) or "?")
-                local amt = tostring(row and (row.amt or row.amount or row.count) or "?")
-                local hpv = tostring(row and (row.hp or row.health or row.Health) or "?")
-                local hnd = tostring(row and (row.handle or row.Handle or row.Id or row.id) or "nil")
                 System.LogAlways(string.format(
-                    "[CorpseSanitizer]   [%d] (fallback) class=%s name=%s hp=%s amt=%s handle=%s",
-                    i0, cls, nm, hpv, amt, hnd))
+                    "[CorpseSanitizer]   [%s] (raw) type=%s repr=%s",
+                    tostring(i0), tostring(type(row)), tostring(row)))
             end
 
             shown = shown + 1
