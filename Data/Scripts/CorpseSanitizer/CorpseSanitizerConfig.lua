@@ -10,12 +10,20 @@ return {
 
     nuker        = {
         enabled             = true,
-        minHp               = 0.00,
+        -- timing
+        preCorpse           = true,
+        preCorpseMaxMeters  = 1.5,
+        doublePassDelays    = { 0, 120 }, -- do pass A immediately, pass B shortly after
+        -- filters
+        onlyIfCorpse        = false,
+        onlyHostile         = true,                        -- <- NEW: act only on hostiles
+        target              = { animals = true, humans = true }, -- flip humans later if you want
+        banNames            = { "dogMeat", "skin_dog" },   -- grow this list
+        banClasses          = {},
+
         skipMoney           = true,
-        onlyIfCorpse        = false, -- < allow nuking NPC inventories
-        preCorpse           = true,  -- < run a quick pre-corpse sweep
+        minHp               = 0.00,
         unequipBeforeDelete = true,
-        preCorpseMaxMeters  = 1.5,   -- only nuke NPCs within this distance of the player
     },
 
     proximity    = { radius = 6.0 },

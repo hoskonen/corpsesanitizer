@@ -308,6 +308,68 @@ local function TryUnequip(subject, ownerWuid, handle)
     return false
 end
 
+local function isHostileToPlayer(e)
+    local p = getPlayer()
+    if not e or not p then return false end
+
+    -- common direct methods
+    for _, fn in ipairs({ "IsHostileTo", "IsHostile", "IsEnemyTo", "IsEnemy", "IsAggressiveTo" }) do
+        local f = e[fn]
+        if type(f) == "function" then
+            local ok, res = pcall(f, e, p)
+            if ok and res then return true end
+        end
+    end
+
+    -- faction-based fallback (treat different factions as hostile if wanted)
+    local ef, pf
+    if e.GetFaction then
+        local ok, v = pcall(e.GetFaction, e); if ok then ef = v end
+    end
+    if p.GetFaction then
+        local ok, v = pcall(p.GetFaction, p); if ok then pf = v end
+    end
+    if ef and pf and ef ~= pf then
+        if CS.config and CS.config.nuker and CS.config.nuker.hostileIfDifferentFaction ~= false then
+            return true
+        end
+    end
+
+    -- “recently damaged by player” style APIs (if present)
+    if e.WasRecentlyDamagedByPlayer and type(e.WasRecentlyDamagedByPlayer) == "function" then
+        local ok, res = pcall(e.WasRecentlyDamagedByPlayer, e, 3.0) -- last 3s
+        if ok and res then return true end
+    end
+
+    return false
+end
+
+local function classifyVictim(e)
+    local nm = "<entity>"; if e and e.GetName then pcall(function() nm = e:GetName() end) end
+    local s = string.lower(tostring(nm))
+    local isAnimal = s:find("dog", 1, true) or s:find("boar", 1, true) or s:find("deer", 1, true)
+        or s:find("rabbit", 1, true) or s:find("wolf", 1, true)
+    return (not not isAnimal), (not isAnimal)
+end
+
+-- case-insensitive ban check
+local function isBannedByConfig(name, classId)
+    local cfg = CS and CS.config and CS.config.nuker
+    if not cfg then return false end
+    local bN, bC = cfg.banNames or {}, cfg.banClasses or {}
+    local n = string.lower(tostring(name or ""))
+    local c = string.lower(tostring(classId or ""))
+
+    for i = 1, #bN do
+        if n == string.lower(tostring(bN[i])) then return true end
+    end
+    for i = 1, #bC do
+        if c == string.lower(tostring(bC[i])) then return true end
+    end
+    return false
+end
+
+local function lower_eq(a, b) return string.lower(tostring(a or "")) == string.lower(tostring(b or "")) end
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Item enumeration (read-only) + pretty logging
@@ -750,7 +812,6 @@ local function tryDeleteForSubject(subject, handle, class, count)
     return false, "no-lane-succeeded", attempts
 end
 
-
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Nuker with verification + UI fallback
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -837,18 +898,43 @@ local function nukeNpcInventory(subject, ctx)
                 or (type(row) == "table" and (row.id or row.Id or row.handle or row.Handle))
                 or nil
 
-            -- optional keep-money (class GUID from your earlier build)
-            if (N.skipMoney) and class == "5ef63059-322e-4e1b-abe8-926e100c770e" then
+            -- Resolve pretty name (from classId) for banlist checks
+            local name   = nil
+            if class and ItemManager and ItemManager.GetItemName then
+                local okNm, nm = pcall(ItemManager.GetItemName, tostring(class))
+                if okNm and nm and nm ~= "" then name = nm end
+            end
+            name = name or class or "?"
+
+            -- Normalize HP here (used by minHp)
+            local hp
+            if it then
+                hp = it.health or it.Health or it.cond
+            end
+            if type(hp) == "number" and hp > 1.001 and hp <= 100 then hp = hp / 100 end
+            hp = hp or 1.0
+
+            -- Money guard (more general than the single GUID)
+            local isMoney = false
+            if N.skipMoney then
+                isMoney = lower_eq(name, "money") or lower_eq(class, "money")
+                    or tostring(class) == "5ef63059-322e-4e1b-abe8-926e100c770e" -- keep your known GUID
+            end
+            if isMoney then
                 kept = kept + 1; break
             end
 
-            -- optional HP gate
-            if it and N.minHp then
-                local hp = it.health or it.Health or it.cond; if hp and hp > 1.001 then hp = hp / 100 end
-                if (hp or 0) < N.minHp then
-                    kept = kept + 1; break
-                end
+            -- HP threshold (if configured)
+            if N.minHp and hp < N.minHp then
+                kept = kept + 1; break
             end
+
+            -- Banlist (names or class GUIDs; case-insensitive)
+            local banned = isBannedByConfig(name, class)
+            if not banned then
+                kept = kept + 1; break
+            end
+
 
             -- owner must match the victim if provided
             if handle and ItemManager and ItemManager.GetItemOwner and ctx.victim then
@@ -986,35 +1072,49 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
         ----------------------------------------------------------------
         -- 2C: PRE-CORPSE SWEEP (engine-side; no SWF writes)
         ----------------------------------------------------------------
+        -- PRE-CORPSE SWEEP (engine-side; no SWF writes)
         if CS and CS.config and CS.config.nuker
             and CS.config.nuker.enabled
             and CS.config.nuker.preCorpse
             and (not CS.config.nuker.onlyIfCorpse) then
-            -- scan for the nearest *non-corpse* humanoid with an inventory we can write
-            local list = scanNearbyOnce((CS.config.proximity and CS.config.proximity.radius) or 6.0, 24)
-            local npcWritable = nil
-            local m = (CS.config.nuker and CS.config.nuker.preCorpseMaxMeters) or 1.5
-            local maxD2 = m * m
+            local corpseNearby = select(1, findNearestCorpse((CS.config.proximity and CS.config.proximity.radius) or 6.0))
+            if not corpseNearby then
+                System.LogAlways("[CorpseSanitizer/Nuke] pre-corpse skipped (no corpse nearby)")
+            else
+                local list  = scanNearbyOnce((CS.config.proximity and CS.config.proximity.radius) or 6.0, 24)
+                local m     = (CS.config.nuker and CS.config.nuker.preCorpseMaxMeters) or 1.5
+                local maxD2 = m * m
+                local tgt   = (CS.config.nuker and CS.config.nuker.target) or { animals = true, humans = true }
 
-            for i = 1, #list do
-                local e  = list[i].e
-                local d2 = list[i].d2 or 1e9
-                if d2 <= maxD2 and e and e ~= getPlayer() and not isCorpseEntity(e) and (e.inventory or e.container or e.stash) then
-                    npcWritable = e
-                    break
+                -- pick the nearest writable NPC that passes target + hostility gates
+                local npcWritable
+                for i = 1, #list do
+                    local e  = list[i].e
+                    local d2 = list[i].d2 or 1e9
+                    if d2 <= maxD2 and e and e ~= getPlayer() and not isCorpseEntity(e)
+                        and (e.inventory or e.container or e.stash) then
+                        local isAnimal, isHuman = classifyVictim(e)
+                        if ((isAnimal and tgt.animals) or (isHuman and tgt.humans))
+                            and (not (CS.config.nuker.onlyHostile or false) or isHostileToPlayer(e)) then
+                            npcWritable = e
+                            break
+                        end
+                    end
+                end
+
+                if npcWritable then
+                    local delays = (CS.config.nuker and CS.config.nuker.doublePassDelays) or { 0, 120 }
+                    for _, ms in ipairs(delays) do
+                        later(ms, function()
+                            pcall(nukeNpcInventory, npcWritable, { victim = npcWritable })
+                        end)
+                    end
+                else
+                    System.LogAlways("[CorpseSanitizer/Nuke] pre-corpse skipped (no writable/hostile target within "
+                        .. string.format("%.2f", m) .. "m)")
                 end
             end
-
-            if npcWritable then
-                System.LogAlways("[CorpseSanitizer/Nuke] pre-corpse candidate within " .. string.format("%.2f", m) .. "m")
-                pcall(nukeNpcInventory, npcWritable, { victim = npcWritable })
-                later(250, function() pcall(nukeNpcInventory, npcWritable, { victim = npcWritable }) end)
-            else
-                System.LogAlways("[CorpseSanitizer/Nuke] pre-corpse skipped (no writable NPC within " ..
-                    string.format("%.2f", m) .. "m)")
-            end
         end
-
 
         local corpse, vdist = findNearestCorpse(8.0)
 
@@ -1026,19 +1126,21 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
             -- A) direct enumeration on corpse
             do
                 local itemsA, howA = tryEnumerateDirectOnEntity(corpse)
+                -- A) direct corpse lane
                 if itemsA then
-                    logItemsTable(itemsA, howA, 20, corpse)
-                    if CS.config.insanityMode and (CS.config.nuker and CS.config.nuker.enabled) then
-                        local okNuke2, errNuke2 = pcall(nukeNpcInventory, corpse, {
-                            items     = itemsA, -- use the rows you just enumerated on corpse
-                            corpseCtx = true,   -- hint to nuker this is corpse-lane
-                            victim    = corpse,
-                        })
-                        if not okNuke2 then log("[nuke] error: " .. tostring(errNuke2)) end
-                    else
-                        log("[NUKE] skipped (insanityMode=false or nuker.disabled)")
+                    -- target gates
+                    local isAnimal, isHuman = classifyVictim(corpse)
+                    local tgt = CS.config.nuker.target or { animals = true, humans = true }
+                    local okVictim = ((isAnimal and tgt.animals) or (isHuman and tgt.humans))
+                    if okVictim and ((not CS.config.nuker.onlyHostile) or isHostileToPlayer(corpse)) then
+                        -- nuke first (faster UX), then re-enum for logging
+                        pcall(nukeNpcInventory, corpse, { items = itemsA, corpseCtx = true, victim = corpse })
+                        itemsA, howA = tryEnum(corpse) -- your local re-enumerator
                     end
-                    return
+
+                    if itemsA and type(itemsA) == "table" then
+                        logInventoryRows(itemsA, howA, 100)
+                    end
                 end
             end
 
