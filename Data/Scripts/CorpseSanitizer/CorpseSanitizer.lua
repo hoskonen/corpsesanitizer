@@ -15,7 +15,7 @@ local DEFAULT_CONFIG = {
 
     ui           = {
         movie        = "ItemTransfer",
-        shadowDelete = true, -- set true in external config if you want UI-only purge when engine blocks writes
+        shadowDelete = false, -- set true in external config if you want UI-only purge when engine blocks writes
     },
 
     proximity    = { radius = 3.0, maxList = 24 },
@@ -24,8 +24,9 @@ local DEFAULT_CONFIG = {
         enabled             = true,
         minHp               = 0.00,
         skipMoney           = true,
-        onlyIfCorpse        = true,
-        unequipBeforeDelete = true, -- NEW: try unequip → delete for dead-NPC gear
+        onlyIfCorpse        = false, -- default now allows NPC nukes
+        preCorpse           = true,  -- default to pre-corpse sweep
+        unequipBeforeDelete = true,
     },
 
     logging      = {
@@ -125,11 +126,14 @@ local function scanNearbyOnce(radiusM, _maxList)
     return list
 end
 
+-- Simple scheduler (Lua 5.1-safe)
 local function later(ms, fn)
-    Script.SetTimer(ms or 0, function()
+    if Script and Script.SetTimer then
+        Script.SetTimer(ms, fn)
+    else
         local ok, err = pcall(fn)
-        if not ok then log("[timer] error: " .. tostring(err)) end
-    end)
+        if not ok then System.LogAlways("[CorpseSanitizer] later() error: " .. tostring(err)) end
+    end
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -589,35 +593,9 @@ function UIRefresh:Probe()
     end
 end
 
-function UIRefresh:Refresh()
-    self:Probe()
-    local function call(path, fn, ...)
-        local sig = path .. "::" .. fn
-        if self.ok[sig] then pcall(UIAction.CallFunction, self.movie, path, fn, ...) end
-        -- also try short form
-        if self.ok[sig] then pcall(UIAction.CallFunction, self.movie, fn, ...) end
-    end
-    call("ItemTransfer", "ClearItems")
-    call("ApseInventoryList", "Clear")
-    call("InventoryView", "InvalidateData")
-    call("ItemTransfer", "OnViewChanged", 0)
-    call("ItemTransfer", "OnViewChanged", 1)
-    call("ApseInventoryList", "OnViewChanged", 0)
-    call("ApseInventoryList", "OnViewChanged", 1)
-    call("ItemTransfer", "RefreshData")
-    call("InventoryView", "Update")
-    if UIAction and UIAction.SendEvent then
-        pcall(UIAction.SendEvent, self.movie, "OnViewChanged", { 0 })
-        pcall(UIAction.SendEvent, self.movie, "OnViewChanged", { 1 })
-    end
-end
+function UIRefresh:Refresh() end
 
-local function ui_remove_row(idStr)
-    ui_try("ItemTransfer", "RemoveItemById", idStr)
-    ui_try("ApseInventoryList", "RemoveItemById", idStr)
-    ui_try("ItemTransfer", "RemoveItem", idStr)
-    ui_try("ApseInventoryList", "fc_removeItem", idStr)
-end
+local function ui_remove_row(idStr) end
 
 -- helper used when we capture handles
 local function uiIdFromHandle(h)
@@ -999,6 +977,45 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
     log(("OnOpened → transfer UI visible (element=%s, instance=%s)"):format(tostring(elementName), tostring(instanceId)))
 
     later(150, function()
+        local corpseNearby = select(1, findNearestCorpse((CS.config.proximity and CS.config.proximity.radius) or 6.0))
+        if not corpseNearby then
+            System.LogAlways("[CorpseSanitizer/Nuke] pre-corpse skipped (no corpse nearby)")
+            return
+        end
+
+        ----------------------------------------------------------------
+        -- 2C: PRE-CORPSE SWEEP (engine-side; no SWF writes)
+        ----------------------------------------------------------------
+        if CS and CS.config and CS.config.nuker
+            and CS.config.nuker.enabled
+            and CS.config.nuker.preCorpse
+            and (not CS.config.nuker.onlyIfCorpse) then
+            -- scan for the nearest *non-corpse* humanoid with an inventory we can write
+            local list = scanNearbyOnce((CS.config.proximity and CS.config.proximity.radius) or 6.0, 24)
+            local npcWritable = nil
+            local m = (CS.config.nuker and CS.config.nuker.preCorpseMaxMeters) or 1.5
+            local maxD2 = m * m
+
+            for i = 1, #list do
+                local e  = list[i].e
+                local d2 = list[i].d2 or 1e9
+                if d2 <= maxD2 and e and e ~= getPlayer() and not isCorpseEntity(e) and (e.inventory or e.container or e.stash) then
+                    npcWritable = e
+                    break
+                end
+            end
+
+            if npcWritable then
+                System.LogAlways("[CorpseSanitizer/Nuke] pre-corpse candidate within " .. string.format("%.2f", m) .. "m")
+                pcall(nukeNpcInventory, npcWritable, { victim = npcWritable })
+                later(250, function() pcall(nukeNpcInventory, npcWritable, { victim = npcWritable }) end)
+            else
+                System.LogAlways("[CorpseSanitizer/Nuke] pre-corpse skipped (no writable NPC within " ..
+                    string.format("%.2f", m) .. "m)")
+            end
+        end
+
+
         local corpse, vdist = findNearestCorpse(8.0)
 
         if corpse then
@@ -1012,9 +1029,10 @@ function CorpseSanitizer:OnOpened(elementName, instanceId, eventName, args)
                 if itemsA then
                     logItemsTable(itemsA, howA, 20, corpse)
                     if CS.config.insanityMode and (CS.config.nuker and CS.config.nuker.enabled) then
-                        local okNuke2, errNuke2 = pcall(nukeNpcInventory, npc, {
-                            items  = items,
-                            victim = npc, -- owner match = NPC’s own WUID
+                        local okNuke2, errNuke2 = pcall(nukeNpcInventory, corpse, {
+                            items     = itemsA, -- use the rows you just enumerated on corpse
+                            corpseCtx = true,   -- hint to nuker this is corpse-lane
+                            victim    = corpse,
                         })
                         if not okNuke2 then log("[nuke] error: " .. tostring(errNuke2)) end
                     else

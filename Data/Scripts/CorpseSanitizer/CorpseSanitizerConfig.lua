@@ -4,23 +4,27 @@ return {
 
     ui           = {
         movie        = "ItemTransfer",
-        shadowDelete = true, -- <- always hide rows if engine blocks writes
+        shadowDelete = false, -- SWF repopulates; don’t shadow-delete
+        echoToUI     = false, -- keep UI mirroring off while testing
     },
 
     nuker        = {
         enabled             = true,
         minHp               = 0.00,
-        skipMoney           = true, -- set false if you also want to purge money
-        onlyIfCorpse        = true, -- <- allow nuking dead-NPC containers too
-        unequipBeforeDelete = true, -- <- try unequip → delete for guarded gear
+        skipMoney           = true,
+        onlyIfCorpse        = false, -- < allow nuking NPC inventories
+        preCorpse           = true,  -- < run a quick pre-corpse sweep
+        unequipBeforeDelete = true,
+        preCorpseMaxMeters  = 1.5,   -- only nuke NPCs within this distance of the player
     },
 
-    proximity    = { radius = 6.0 }, -- your current preference
+    proximity    = { radius = 6.0 },
 
     logging      = {
         prettyOwner     = true,
         probeOnMiss     = false,
         showWouldDelete = true,
         nuker           = true,
+        dumpRows        = true,
     },
 }
